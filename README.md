@@ -190,7 +190,9 @@ Pass the 'Main Content' data from post-processing to perform summarisation and c
 - **Website Citations**: Responses cite sources by name (e.g., `[canarymedia]`)
 - **Metadata Display**: Shows title, date, URL, tech fields
 
-**Use Case**: Ask questions like "What are the latest hydrogen fuel cell developments?" and get cited answers from your sources
+**Example Usage: Watch the demo below**
+
+[![Watch the video](https://img.youtube.com/vi/4I89Ku_sAt4/maxresdefault.jpg)](https://www.youtube.com/watch?v=4I89Ku_sAt4)
 
 ---
 
