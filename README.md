@@ -44,14 +44,14 @@ cp .env.example .env
 ### Required Environment Variables
 
 ```bash
-OPENAI_API_KEY=your_openai_key
+OPENAI_API_KEY=your_openai_key # Used for embeddings
 AZURE_OPENAI_API_KEY=your_azure_key
 AZURE_OPENAI_ENDPOINT=your_azure_endpoint
 AZURE_OPENAI_API_VERSION=2024-02-15-preview
-
-# SearXNG (for web search)
-SEARXNG_URL=http://localhost:8888
 ```
+
+Start SearXNG instance:
+```docker run -d -p 32768:8080 searxng/searxng```
 
 ### Run the Application
 
