@@ -1,0 +1,30 @@
+============================================================
+SUMMARIZATION LOG
+============================================================
+
+Source File: carboncapturemagazine_20251029.csv
+Date: 2025-10-29 15:33:43
+Content Column: content
+
+------------------------------------------------------------
+PROCESSING STATISTICS
+------------------------------------------------------------
+Total Rows: 500
+Successfully Processed: 500
+Failed: 0
+Success Rate: 100.00%
+
+------------------------------------------------------------
+DURATION
+------------------------------------------------------------
+Total Duration: 653.31 seconds
+Average per Row: 1.31 seconds
+
+------------------------------------------------------------
+OUTPUT FILES
+------------------------------------------------------------
+Summarized CSV: carboncapturemagazine_20251029.csv
+Summarized JSON: carboncapturemagazine_20251029.json
+Log File: carboncapturemagazine_20251029_log.txt
+
+============================================================

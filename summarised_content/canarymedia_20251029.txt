@@ -1,0 +1,30 @@
+============================================================
+SUMMARIZATION LOG
+============================================================
+
+Source File: canarymedia_processed_20251029_095438.csv
+Date: 2025-10-29 10:05:06
+Content Column: content
+
+------------------------------------------------------------
+PROCESSING STATISTICS
+------------------------------------------------------------
+Total Rows: 500
+Successfully Processed: 498
+Failed: 2
+Success Rate: 99.60%
+
+------------------------------------------------------------
+DURATION
+------------------------------------------------------------
+Total Duration: 588.34 seconds
+Average per Row: 1.18 seconds
+
+------------------------------------------------------------
+OUTPUT FILES
+------------------------------------------------------------
+Summarized CSV: canarymedia_processed_20251029_095438_summarized_20251029_100506.csv
+Summarized JSON: canarymedia_processed_20251029_095438_summarized_20251029_100506.json
+Log File: canarymedia_processed_20251029_095438_log_20251029_100506.txt
+
+============================================================

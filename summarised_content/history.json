@@ -1,0 +1,38 @@
+[
+    {
+        "source_file": "thinkgeoenergy_processed_20251028_233006.csv",
+        "total_rows": 500,
+        "successful": 500,
+        "failed": 0,
+        "duration_seconds": 613.871945142746,
+        "timestamp": "2025-10-28T23:46:53.361125",
+        "content_column": "content",
+        "output_csv_path": "summarised_content/thinkgeoenergy_processed_20251028_233006_summarized_20251028_234653.csv",
+        "output_json_path": "summarised_content/thinkgeoenergy_processed_20251028_233006_summarized_20251028_234653.json",
+        "output_log_path": "summarised_content/thinkgeoenergy_processed_20251028_233006_log_20251028_234653.txt"
+    },
+    {
+        "source_file": "canarymedia_processed_20251029_095438.csv",
+        "total_rows": 500,
+        "successful": 498,
+        "failed": 2,
+        "duration_seconds": 588.3379848003387,
+        "timestamp": "2025-10-29T10:05:06.014141",
+        "content_column": "content",
+        "output_csv_path": "summarised_content/canarymedia_processed_20251029_095438_summarized_20251029_100506.csv",
+        "output_json_path": "summarised_content/canarymedia_processed_20251029_095438_summarized_20251029_100506.json",
+        "output_log_path": "summarised_content/canarymedia_processed_20251029_095438_log_20251029_100506.txt"
+    },
+    {
+        "source_file": "carboncapturemagazine_20251029.csv",
+        "total_rows": 500,
+        "successful": 500,
+        "failed": 0,
+        "duration_seconds": 653.3093109130859,
+        "timestamp": "2025-10-29T15:33:43.455979",
+        "content_column": "content",
+        "output_csv_path": "summarised_content/carboncapturemagazine_20251029.csv",
+        "output_json_path": "summarised_content/carboncapturemagazine_20251029.json",
+        "output_log_path": "summarised_content/carboncapturemagazine_20251029_log.txt"
+    }
+]
