@@ -192,7 +192,7 @@ Pass the 'Main Content' data from post-processing to perform summarisation and c
 
 **Example Usage: Watch the demo below**
 
-[![Watch the video](https://img.youtube.com/vi/4I89Ku_sAt4/maxresdefault.jpg)](https://www.youtube.com/watch?v=4I89Ku_sAt4)
+https://github.com/user-attachments/assets/040f88ba-3a4d-4543-9ded-d297d0175d12
 
 ---
 
