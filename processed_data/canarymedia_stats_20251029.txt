@@ -1,0 +1,14 @@
+Markdown Post-Processing Summary
+================================================================================
+
+Source folder: crawled_data/canarymedia
+Processing date: 2025-10-29 09:54:38
+
+Total markdown files: 500
+Successfully processed: 500
+Skipped (old): 0
+Skipped (error): 0
+
+Output files:
+  - CSV: canarymedia_processed_20251029_095438.csv
+  - JSON: canarymedia_processed_20251029_095438.json
