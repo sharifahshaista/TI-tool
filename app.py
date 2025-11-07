@@ -2543,10 +2543,14 @@ elif page == "Database":
             # Sort categories alphabetically within each cell
             if 'categories' in combined_df.columns:
                 def sort_categories(cat_string):
-                    if pd.isna(cat_string) or not str(cat_string).strip():
+                    # Handle NaN, None, or empty values
+                    if cat_string is None or (isinstance(cat_string, float) and pd.isna(cat_string)):
+                        return ''
+                    cat_str = str(cat_string).strip()
+                    if not cat_str:
                         return ''
                     # Split by semicolon, strip whitespace, sort alphabetically, rejoin
-                    cats = [c.strip() for c in str(cat_string).split(';') if c.strip()]
+                    cats = [c.strip() for c in cat_str.split(';') if c.strip()]
                     sorted_cats = sorted(cats, key=lambda x: x.lower())
                     return '; '.join(sorted_cats)
                 
@@ -2629,7 +2633,13 @@ elif page == "Database":
         st.metric("Total Entries", len(combined_df))
     with col3:
         if 'categories' in combined_df.columns:
-            unique_categories = combined_df['categories'].str.split(';').explode().str.strip().nunique()
+            # Ensure we're working with a Series, not a DataFrame
+            categories_series = combined_df['categories']
+            if isinstance(categories_series, pd.DataFrame):
+                categories_series = categories_series.iloc[:, 0]  # Take first column if DataFrame
+            
+            # Count unique categories
+            unique_categories = categories_series.astype(str).str.split(';').explode().str.strip().nunique()
             st.metric("Unique Categories", unique_categories)
     
     st.divider()
