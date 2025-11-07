@@ -629,7 +629,7 @@ Crawled: {datetime.now().isoformat()}
                     threshold_type="dynamic",  # Adaptive threshold
                 ),
                 options={
-                    "ignore_links": True,  # Changed to remove links
+                    "ignore_links": False,
                     "citations": True
                 }
             )
@@ -870,17 +870,9 @@ Crawled: {datetime.now().isoformat()}
             )
             
             crawl_config = CrawlerRunConfig(
-                scraping_strategy=LXMLWebScrapingStrategy(
-                    parser="html.parser",  # More forgiving parser
-                    fail_on_error=False,   # Continue even if parsing isn't perfect
-                    encoding_errors="replace"  # Handle encoding issues gracefully
-                ),
+                scraping_strategy=LXMLWebScrapingStrategy(),
                 cache_mode=CacheMode.BYPASS,
-                verbose=True,  # Enable verbose logging for debugging
-                excluded_tags=["nav", "footer", "header", "aside", "form"],  # Skip non-content areas
-                page_timeout=60000,  # Longer timeout
-                wait_until="networkidle0",  # Wait for network to be idle
-                magic=True  # Enable anti-detection features
+                verbose=False
             )
             
             crawler = AsyncWebCrawler(config=browser_config)
@@ -1212,18 +1204,18 @@ Crawled: {datetime.now().isoformat()}
                 # Handle sitemap index
                 namespaces = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
                 
-                # Check for child sitemaps (sitemap index)
+                # Check if it's a sitemap index
                 sitemaps = root.findall(".//sm:sitemap/sm:loc", namespaces)
                 if sitemaps:
                     # Recursively fetch from child sitemaps
                     for sitemap in sitemaps:
                         child_urls = await self._fetch_sitemap_urls(sitemap.text)
                         urls.extend(child_urls)
-                
-                # Also check for regular URLs (some sitemaps have both)
-                url_elements = root.findall(".//sm:url/sm:loc", namespaces)
-                for url_elem in url_elements:
-                    urls.append(url_elem.text)
+                else:
+                    # Regular sitemap with URLs
+                    url_elements = root.findall(".//sm:url/sm:loc", namespaces)
+                    for url_elem in url_elements:
+                        urls.append(url_elem.text)
         
         except Exception as e:
             print(f"Error fetching sitemap {sitemap_url}: {e}")

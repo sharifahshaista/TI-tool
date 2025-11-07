@@ -313,7 +313,7 @@ st.markdown("AI-powered tool equipped with discovery of sources, web-crawling, p
 st.sidebar.header("Navigation")
 page = st.sidebar.radio(
     "Select Mode",
-    ["Web Search", "Web Crawler", "Post-Processing", "Summarization", "Database", "RAG", "About"],
+    ["Web Search", "Web Crawler", "Post-Processing", "LLM Extraction", "Summarization", "Database", "RAG", "About"],
     label_visibility="collapsed"
 )
 
@@ -1688,6 +1688,247 @@ elif page == "Post-Processing":
             st.info("No processing results available. Run a processing task first.")
     
     # (Removed Start Post-Processing button and inline handler by request)
+
+
+# LLM Extraction Page
+elif page == "LLM Extraction":
+    st.header("LLM Extraction")
+    st.markdown("Use AI models to intelligently extract structured metadata from markdown files")
+
+    # Folder selection
+    st.subheader("Select Data Source")
+
+    # Get list of available crawled folders
+    crawled_data_path = Path("crawled_data")
+    available_folders = []
+
+    if crawled_data_path.exists():
+        available_folders = [
+            f.name for f in crawled_data_path.iterdir()
+            if f.is_dir() and not f.name.startswith('.')
+        ]
+
+    if available_folders:
+        # Sort folders by modification time (newest first)
+        available_folders.sort(
+            key=lambda x: (crawled_data_path / x).stat().st_mtime,
+            reverse=True
+        )
+
+        markdown_folder_name = st.selectbox(
+            "Select Crawled Folder",
+            options=available_folders,
+            help="Choose a folder from crawled_data/ directory",
+            key="llm_extraction_folder"
+        )
+        markdown_folder = f"crawled_data/{markdown_folder_name}"
+
+        # Show folder info
+        folder_path = crawled_data_path / markdown_folder_name
+        md_count = len(list(folder_path.rglob('*.md')))
+        st.caption(f"📁 {md_count} markdown files in this folder")
+    else:
+        st.warning("No crawled folders found. Please run the Web Crawler first.")
+        markdown_folder = st.text_input(
+            "Markdown Folder (manual entry)",
+            value="saved_md",
+            help="Folder containing markdown files from web crawler",
+            key="llm_manual_folder"
+        )
+
+    # Model configuration (uses your configured LLM provider)
+    st.subheader("Model Configuration")
+    
+    # Get current LLM provider from environment
+    current_provider = os.getenv("LLM_PROVIDER", "azure").lower()
+    provider_display = {
+        "azure": "Azure OpenAI",
+        "openai": "OpenAI",
+        "lm_studio": "LM Studio (Local)"
+    }.get(current_provider, "Azure OpenAI")
+    
+    st.info(f"🤖 Using configured provider: **{provider_display}**")
+    st.caption("Change provider in sidebar Settings if needed")
+    
+    # Model name input
+    if current_provider == "azure":
+        model_name_default = os.getenv("AZURE_OPENAI_MODEL_NAME", "gpt-4")
+    elif current_provider == "openai":
+        model_name_default = os.getenv("OPENAI_MODEL_NAME", "gpt-4")
+    else:  # lm_studio
+        model_name_default = "local-model"
+    
+    model_name = st.text_input(
+        "Model Name",
+        value=model_name_default,
+        help="Model to use for extraction"
+    )
+
+    # Output folder
+    output_folder = st.text_input(
+        "Output Folder",
+        value="processed_data",
+        help="Folder to save processed CSV/JSON files",
+        key="llm_output_folder"
+    )
+
+    # Start processing button
+    if st.button("🤖 Start LLM Extraction", type="primary", use_container_width=True):
+        markdown_path = Path(markdown_folder)
+
+        if not markdown_path.exists():
+            st.error(f"Folder '{markdown_folder}' does not exist")
+        else:
+            # Check for markdown files
+            md_files = list(markdown_path.rglob('*.md'))
+
+            if not md_files:
+                st.error(f"No markdown files found in '{markdown_folder}'")
+            else:
+                st.info(f"Found {len(md_files)} markdown files")
+
+                # Create progress containers
+                progress_container = st.container()
+                status_container = st.container()
+
+                with progress_container:
+                    progress_bar = st.progress(0)
+                    progress_text = st.empty()
+                    time_text = st.empty()
+
+                with status_container:
+                    status_text = st.empty()
+
+                # Start processing with progress tracking
+                try:
+                    from agents.llm_extractor import process_folder_with_progress, get_openai_client
+                    import asyncio
+
+                    # Set processing state
+                    st.session_state.processing_in_progress = True
+                    st.session_state.processing_progress = {'current': 0, 'total': 0, 'elapsed': 0, 'remaining': 0}
+                    st.session_state.processing_start_time = time.time()
+
+                    def processing_progress_callback(message, current, total):
+                        """Progress callback for processing updates"""
+                        if total > 0:
+                            progress = current / total
+                            progress_bar.progress(progress)
+                            progress_text.text(f"Processing: {current}/{total} ({progress*100:.1f}%)")
+
+                            # Calculate time estimates
+                            elapsed = time.time() - st.session_state.get('processing_start_time', time.time())
+                            remaining = 0
+                            if current > 0:
+                                estimated_total = elapsed * total / current
+                                remaining = max(0, estimated_total - elapsed)
+
+                                time_text.text(f"⏱️ Elapsed: {format_time(elapsed)} | Remaining: {format_time(remaining)}")
+                            else:
+                                time_text.text(f"⏱️ Elapsed: {format_time(elapsed)} | Remaining: Calculating...")
+
+                            # Update session state
+                            st.session_state.processing_progress = {
+                                'current': current,
+                                'total': total,
+                                'elapsed': elapsed,
+                                'remaining': remaining
+                            }
+
+                            status_text.text(f"🔄 {message}")
+
+                    # Get client based on current provider
+                    client = get_openai_client(
+                        provider=current_provider,
+                        base_url=os.getenv("LM_STUDIO_BASE_URL") if current_provider == "lm_studio" else None
+                    )
+
+                    # Run the LLM extractor with progress tracking
+                    df, stats = asyncio.run(process_folder_with_progress(
+                        folder_path=Path(markdown_folder),
+                        output_dir=Path(output_folder),
+                        client=client,
+                        model_name=model_name,
+                        progress_callback=processing_progress_callback
+                    ))
+
+                    st.session_state.csv_processed_df = df
+                    st.session_state.csv_metadata = stats
+
+                    # Clear processing state
+                    st.session_state.processing_in_progress = False
+
+                    # Show completion message
+                    progress_bar.progress(1.0)
+                    progress_text.text("✅ LLM Extraction Complete!")
+                    total_time = time.time() - st.session_state.processing_start_time
+                    time_text.text(f"⏱️ Total time: {format_time(total_time)}")
+                    status_text.text(f"🎉 Successfully processed {len(df)} articles")
+
+                    # Show completion statistics
+                    st.success("✅ LLM extraction complete!")
+
+                    # Display processing stats
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total Files", stats.get('total_files', len(df)))
+                    with col2:
+                        st.metric("Processed", stats.get('processed', len(df)))
+                    with col3:
+                        st.metric("Failed", stats.get('skipped_error', 0))
+                    with col4:
+                        success_rate = stats.get('processed', len(df)) / stats.get('total_files', len(df)) * 100 if stats.get('total_files', len(df)) > 0 else 0
+                        st.metric("Success Rate", f"{success_rate:.1f}%")
+
+                    # Show results
+                    st.markdown("---")
+                    st.subheader("Extraction Results")
+                    
+                    # Show first few rows
+                    st.dataframe(df.head(10), use_container_width=True)
+                    
+                    # Download options
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        csv_data = df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download CSV",
+                            data=csv_data,
+                            file_name=f"llm_extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                    with col2:
+                        json_data = df.to_json(orient='records', indent=2).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download JSON",
+                            data=json_data,
+                            file_name=f"llm_extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            use_container_width=True
+                        )
+
+                    # Show info about extracted fields
+                    with st.expander("ℹ️ Extracted Fields Information"):
+                        st.markdown("""
+                        **Extracted Fields:**
+                        - **URL**: Original article URL
+                        - **Title**: Article title
+                        - **Publication Date**: When the article was published
+                        - **Main Content**: Full article content
+                        - **Categories**: Article categories/topics
+                        - **Token Usage**: Prompt, completion, and total tokens used
+                        
+                        The extraction uses your configured LLM provider ({}) to intelligently
+                        parse markdown files and extract structured metadata.
+                        """.format(provider_display))
+
+                except Exception as e:
+                    st.session_state.processing_in_progress = False
+                    st.error(f"LLM extraction failed: {str(e)}")
+                    import traceback
+                    with st.expander("Error Details"):
+                        st.code(traceback.format_exc())
 
 
 # Summarization Page
