@@ -21,6 +21,7 @@ TI Agent is a comprehensive Streamlit application that automates the entire work
 - Python 3.11+
 - OpenAI API key or Azure OpenAI credentials
 - SearXNG instance (for web search)
+- Crawl4AI instance (for web crawling)
 
 ### Installation
 
@@ -52,6 +53,18 @@ AZURE_OPENAI_API_VERSION=2024-02-15-preview
 
 Start SearXNG instance:
 ```docker run -d -p 32768:8080 searxng/searxng```
+
+Start Crawl4AI instance:
+```docker run -d \
+-p 11235:11235 \
+  --name crawl4ai \
+  --shm-size=1g \
+  unclecode/crawl4ai:latest```
+
+```pip install crawl4ai
+crawl4ai-setup
+crawl4ai-doctor
+```
 
 ### Run the Application
 

@@ -870,9 +870,17 @@ Crawled: {datetime.now().isoformat()}
             )
             
             crawl_config = CrawlerRunConfig(
-                scraping_strategy=LXMLWebScrapingStrategy(),
+                scraping_strategy=LXMLWebScrapingStrategy(
+                    parser="html.parser",  # More forgiving parser
+                    fail_on_error=False,   # Continue even if parsing isn't perfect
+                    encoding_errors="replace"  # Handle encoding issues gracefully
+                ),
                 cache_mode=CacheMode.BYPASS,
-                verbose=False
+                verbose=True,  # Enable verbose logging for debugging
+                excluded_tags=["nav", "footer", "header", "aside", "form"],  # Skip non-content areas
+                page_timeout=60000,  # Longer timeout
+                wait_until="networkidle0",  # Wait for network to be idle
+                magic=True  # Enable anti-detection features
             )
             
             crawler = AsyncWebCrawler(config=browser_config)
