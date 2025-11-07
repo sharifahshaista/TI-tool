@@ -3190,7 +3190,67 @@ if st.session_state.crawling_in_progress:
             st.session_state.crawl_progress = {'current': 0, 'total': 0, 'elapsed': 0, 'remaining': 0, 'start_time': None}
             st.rerun()
 
-st.sidebar.markdown("### Settings")
+st.sidebar.markdown("### ⚙️ Settings")
+
+# LLM Provider Configuration
+st.sidebar.markdown("#### 🤖 LLM Provider")
+from config.model_config import MODEL_OPTIONS, get_available_providers
+
+# Get current provider from environment
+current_provider = os.getenv("LLM_PROVIDER", "azure").lower()
+
+# Map provider codes to display names
+provider_display_map = {
+    "azure": "Azure OpenAI",
+    "openai": "OpenAI",
+    "lm_studio": "LM Studio (Local)"
+}
+
+# Get available providers
+available_providers = get_available_providers()
+
+# Create selectbox options - just use the available providers directly
+provider_options = []
+for code in available_providers:
+    display_name = provider_display_map.get(code, code)
+    provider_options.append(display_name)
+
+if provider_options:
+    # Find current selection
+    current_display = provider_display_map.get(current_provider, "LM Studio (Local)")
+    current_index = provider_options.index(current_display) if current_display in provider_options else 0
+    
+    selected_provider_display = st.sidebar.selectbox(
+        "Select LLM Provider",
+        provider_options,
+        index=current_index,
+        help="Choose which LLM provider to use for AI operations"
+    )
+    
+    # Reverse map display name to code
+    reverse_map = {v: k for k, v in provider_display_map.items()}
+    selected_provider = reverse_map.get(selected_provider_display, "lm_studio")
+    
+    # Update environment variable if changed
+    if selected_provider != current_provider:
+        os.environ["LLM_PROVIDER"] = selected_provider
+        st.sidebar.success(f"✅ Switched to {selected_provider_display}")
+    
+    # Show provider-specific info
+    if selected_provider == "azure":
+        model_name = os.getenv("AZURE_OPENAI_MODEL_NAME", "gpt-4")
+        st.sidebar.caption(f"Model: {model_name}")
+    elif selected_provider == "openai":
+        model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4")
+        st.sidebar.caption(f"Model: {model_name}")
+    elif selected_provider == "lm_studio":
+        base_url = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+        st.sidebar.caption(f"Server: {base_url}")
+        st.sidebar.caption("💡 Ensure LM Studio is running with a model loaded")
+else:
+    st.sidebar.warning("⚠️ No LLM provider configured. Please set up your .env file.")
+
+st.sidebar.divider()
 st.sidebar.info(f"Session ID: {id(st.session_state)}")
 
 if st.sidebar.button("Clear Session"):

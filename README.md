@@ -19,7 +19,10 @@ TI Agent is a comprehensive Streamlit application that automates the entire work
 ### Prerequisites
 
 - Python 3.11+
-- OpenAI API key or Azure OpenAI credentials
+- **One of the following LLM providers:**
+  - Azure OpenAI API credentials, OR
+  - OpenAI API key, OR
+  - LM Studio running locally with a model loaded
 - SearXNG instance (for web search)
 - Crawl4AI instance (for web crawling)
 
@@ -39,8 +42,45 @@ pip install -r requirements.txt
 
 # Set up environment variables
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with your API keys and LLM provider choice
 ```
+
+### LLM Provider Configuration
+
+This tool supports **three LLM providers**. Choose one and configure it in your `.env` file:
+
+#### Option 1: Azure OpenAI (Recommended for enterprise)
+
+```bash
+LLM_PROVIDER=azure
+AZURE_OPENAI_API_KEY=your_azure_openai_api_key
+AZURE_OPENAI_ENDPOINT=https://your-resource-name.openai.azure.com/
+OPENAI_API_VERSION=2023-12-01-preview
+AZURE_OPENAI_MODEL_NAME=gpt-4
+```
+
+#### Option 2: OpenAI API (Easiest to get started)
+
+```bash
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-your_openai_api_key_here
+OPENAI_MODEL_NAME=gpt-4
+```
+
+#### Option 3: LM Studio (Free, runs locally)
+
+1. Download and install [LM Studio](https://lmstudio.ai/)
+2. Load a model (recommended: Llama 3, Mistral, or similar 7B+ model)
+3. Start the local server (Server tab → Start Server)
+4. Configure `.env`:
+
+```bash
+LLM_PROVIDER=lm_studio
+LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
+LM_STUDIO_API_KEY=lm-studio
+```
+
+**Note:** LM Studio uses whatever model you have loaded in the application.
 
 ### Required Environment Variables
 

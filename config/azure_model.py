@@ -1,62 +1,29 @@
+"""
+Azure OpenAI model configuration
+This module maintains backward compatibility while supporting the new multi-provider system
+"""
 import os
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, HttpUrl, field_validator, ValidationError
-from pydantic_settings import BaseSettings
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.azure import AzureProvider
 
+# Load environment variables
 load_dotenv()
 
-# Configuration Models
-class AzureConfig(BaseModel):
-    """Azure OpenAI configuration"""
-    api_key: str
-    api_version: str
-    azure_endpoint: HttpUrl
-    model_name: str = Field(default="pmo-gpt-4.1-nano")
+# Set default API version if not set
+if not os.getenv('OPENAI_API_VERSION'):
+    os.environ['OPENAI_API_VERSION'] = '2023-12-01-preview'
 
-    @field_validator('api_key', 'api_version')
-    @classmethod
-    def validate_not_empty(cls, v):
-        if not v or not v.strip():
-            raise ValueError("Value cannot be empty")
-        return v
+# For backward compatibility, export the model string
+# This uses the new get_model function to get the appropriate model
+from config.model_config import get_model
 
-
-class Settings(BaseSettings):
-    """Application settings from environment"""
-    azure_api_key: str = Field(alias="AZURE_OPENAI_API_KEY")
-    azure_api_version: str = Field(alias="AZURE_OPENAI_API_VERSION")
-    azure_endpoint: HttpUrl = Field(alias="AZURE_OPENAI_ENDPOINT")
-
-    model_name: str = Field(default="pmo-gpt-4.1-nano")
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-        extra = "ignore"  # Ignore extra fields from .env
-
-# Initialize settings
+# Default to Azure model for backward compatibility
+# Can be overridden by setting LLM_PROVIDER environment variable
 try:
-    settings = Settings()
-    azure_config = AzureConfig(
-        api_key=settings.azure_api_key,
-        api_version=settings.azure_api_version,
-        azure_endpoint=settings.azure_endpoint,
-        model_name=settings.model_name
+    model = get_model(
+        provider=os.getenv("LLM_PROVIDER", "azure"),
+        model_name=os.getenv("AZURE_OPENAI_MODEL_NAME") or os.getenv("OPENAI_MODEL_NAME")
     )
-except ValidationError as e:
-    print(f"Configuration error: {e}")
-    raise
-
-azure_provider = AzureProvider(
-    api_key=azure_config.api_key,
-    api_version=azure_config.api_version,
-    azure_endpoint=str(azure_config.azure_endpoint),
-)
-
-model = OpenAIChatModel(
-    model_name=azure_config.model_name,
-    provider=azure_provider,
-)
-
+except Exception as e:
+    print(f"Warning: Could not initialize model from config: {e}")
+    # Fallback for backward compatibility
+    model = "azure:gpt-4"
