@@ -30,7 +30,7 @@ TI Agent is a comprehensive Streamlit application that automates the entire work
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/sharifahshaista/TI-tool.git
 cd TI-agent
 
 # Create virtual environment
