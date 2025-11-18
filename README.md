@@ -1,19 +1,12 @@
 # TI-tool
 This is a prototype tool to complement technology intelligence.
 
-## 🚀 Quick Links
-
-- **[Quick Deploy (15 min)](QUICK_DEPLOY.md)** - Fast deployment to Streamlit Cloud
-- **[Streamlit Cloud Deployment Guide](STREAMLIT_CLOUD_DEPLOYMENT.md)** - Complete cloud deployment docs
-- **[AWS Deployment Guide](deployment/AWS_DEPLOYMENT_GUIDE.md)** - Self-hosted AWS EC2 option
-- **[Deployment Checklist](DEPLOYMENT_CHECKLIST.md)** - Pre-deployment verification
-
 ## Overview
 
 TI Agent is a comprehensive Streamlit application that automates the entire workflow of technology intelligence gathering:
 
 1. **Web Search** - AI-assisted research with clarification and SERP generation
-2. **Web Crawler** - Intelligent website crawling with URL filtering
+2. **Web Crawler** - Website crawling with post-processing URL filtering
 3. **LLM Extraction** - Extract structured metadata from crawled content using AI
 4. **Summarization** - AI-powered tech-intelligence analysis and categorization
 5. **Database** - Consolidated searchable database with advanced filtering
@@ -28,7 +21,7 @@ TI Agent is a comprehensive Streamlit application that automates the entire work
 
 - Python 3.11+
 - **One of the following LLM providers:**
-  - Azure OpenAI API credentials, OR
+  - Azure OpenAI API credentials (ideally), OR
   - OpenAI API key, OR
   - LM Studio running locally with a model loaded
 - SearXNG instance (for web search)
@@ -75,7 +68,8 @@ OPENAI_API_KEY=sk-your_openai_api_key_here
 OPENAI_MODEL_NAME=gpt-4
 ```
 
-#### Option 3: LM Studio (Free, runs locally)
+#### Option 3: LM Studio 
+(Functional only if tool runs locally. Configure AWS S3 ```bash USE_S3_STORAGE=False``` too)
 
 1. Download and install [LM Studio](https://lmstudio.ai/)
 2. Load a model (recommended: Llama 3, Mistral, or similar 7B+ model)
@@ -149,29 +143,6 @@ Navigate to `http://localhost:8501` in your browser.
 
 ---
 
-## ☁️ Cloud Deployment
-
-### Streamlit Community Cloud (Recommended for PoC)
-
-**Free tier**: 1 private app, unlimited public apps
-
-See **[STREAMLIT_CLOUD_DEPLOYMENT.md](STREAMLIT_CLOUD_DEPLOYMENT.md)** for complete deployment instructions.
-
-**Quick steps:**
-1. Create AWS S3 bucket for storage
-2. Push code to GitHub
-3. Deploy on [share.streamlit.io](https://share.streamlit.io/)
-4. Add secrets in Streamlit Cloud settings
-5. Done! ✨
-
-### AWS EC2 (Production Deployment)
-
-For self-hosted production environments with full control.
-
-See **[deployment/AWS_DEPLOYMENT_GUIDE.md](deployment/AWS_DEPLOYMENT_GUIDE.md)** for detailed instructions.
-
----
-
 ## Project Structure
 
 ```
@@ -185,16 +156,15 @@ TI-tool/
 │   ├── config.toml                 # Streamlit configuration
 │   └── secrets.toml.example        # Secrets template
 │
-├── STREAMLIT_CLOUD_DEPLOYMENT.md   # Cloud deployment guide
 ├── README.md                       # This file
 │
 ├── agents/                         # AI agents and processors
 │   ├── clarification.py            # Research clarification agent
 │   ├── serp.py                     # SERP query generation
 │   ├── learn.py                    # Learning extraction agent
-│   ├── web_crawler.py              # Multi-strategy web crawler
-│   ├── summarise_csv.py            # Tech-intelligence summarizer
-│   └── crawl_strategy_detector.py  # Auto-detect best crawl strategy
+│   ├── llm_extractor.py            # Metadata extractor using LLM
+│   ├── web_search.py               # Research agent
+│   └── summarise_csv.py            # Tech-intelligence summarizer
 │
 ├── config/                         # Configuration modules
 │   ├── model_config.py             # LLM provider configuration
@@ -206,12 +176,8 @@ TI-tool/
 ├── webcrawler/                     # Web crawler modules
 │   ├── scraper.py                  # Core scraping logic
 │   ├── url_utils.py                # URL utilities
+│   ├── (...)                       # Others to handle robots.txt and URL tracking
 │   └── content_extractor.py        # Content extraction
-│
-├── deployment/                     # Deployment guides
-│   ├── AWS_DEPLOYMENT_GUIDE.md     # EC2 deployment
-│   ├── QUICK_START.md              # Quick start guide
-│   └── setup_ec2.sh                # EC2 setup script
 │
 └── S3 Storage (crawled_data/, processed_data/, summarised_content/, rag_storage/)
     # All data stored in AWS S3 bucket for persistence
@@ -248,37 +214,10 @@ This application uses **AWS S3** for persistent storage instead of local filesys
 **Two-tab interface combining crawling and URL filtering:**
 
 #### Tab 1: Crawl Websites
-- **Automatically determine** the optimal strategy to scrape websites from the user's input, chosen from six strategies. Users can manually select crawling strategy as well.
-
-   * **Simple Discovery**  
-     > Starts with the input URL, discovers all internal links on the page, and crawls each discovered link sequentially.
-
-   * **Sitemap**  
-     > Finds and parses XML sitemaps of the input URL. Prioritizes the largest numbered links containing terms such as *"post-sitemap"*, *"news"*, *"articles"*, or *"post"* (e.g., `post-sitemap17.xml`).
-
-   * **Pagination**  
-     > Automatically tests different URL-based and query-based pagination patterns (e.g., `/page/2`, `?page=2`, `/p2`, `/p/2`), then crawls links discovered on each page.
-
-   * **Category**  
-     > Focuses on a specific category or topic path, performing deep crawling with content filtering.  
-     > Default category pages include `/articles/`, `/news/`, `/blog/`, and `/reports/`.  
-     > The crawler stays within these category domains.
-
-   * **Breadth-first Search (BFS) Deep Crawl**  
-     > Crawls all pages at depth 1, then all pages at depth 2 and so on. Configurable by `max_depth`
-     > Uses BFS traversal algorithm
-     > Suitable if website structure is being studied.
-
-   * **Depth-first Search (DFS) Deep Crawl**  
-     > Crawls each pages from depth 1 to `max_depth`.
-     > Uses DFS traversal algorithm
-     > Suitable for content chains and focused explorations.
-
- - **Crawls** websites using [Crawl4AI](https://docs.crawl4ai.com/). Results saved to S3 in CSV format.
+- Configure crawler based on number of pages, duration of delay and whether to overwrite previous history of crawling a website. Crawl logs are displayed in the terminal, **not** on the UI.
 
 #### Tab 2: Filter URLs
-- Remove unwanted URLs from crawled data
-- Customizable filter patterns (e.g., `/about`, `/author`, `/contact`)
+- Remove unwanted URLs from crawled data (e.g., `/about`, `/author`, `/contact`) *(the noisy data)*
 - Preview filtered results before saving
 - Saves filtered data to `processed_data/` in S3
 
@@ -290,7 +229,6 @@ Use AI models to intelligently extract structured metadata from markdown files:
    * Main Content
    * Author
    * Tags/Categories
-   * Custom fields as needed
 
 ### 4. Summarisation 
 Upload or select processed CSV files from S3 to perform summarization and classification:
@@ -351,6 +289,12 @@ https://github.com/user-attachments/assets/813787e0-2526-40b6-a148-da4eb46a82bc
    Build vector index
    ↓
    Query with AI citations
+
+6. Linkedin Home Feed Monitor
+   ↓
+   Adjust settings of 'scraper' based on number of days back and scroll pause duration.
+   ↓
+   Download results, or store in S3
 ```
 
 ---
@@ -391,26 +335,12 @@ This makes it easy to:
 
 The app supports multiple LLM providers:
 
-- **Azure OpenAI** (default): `pmo-gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`
+- **Azure OpenAI** (default): `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`
 - **OpenAI**: Standard OpenAI models
 - **LM Studio**: Local models
 - **Anthropic**: Claude models
-- **Groq**: Fast inference
 
 Configure in the Summarization or RAG pages.
-
-### Crawl Strategies
-
-Choose the best strategy for your target:
-
-| Strategy | Best For | Speed |
-|----------|----------|-------|
-| **Sitemap** | Sites with XML sitemaps | Fast ⚡ |
-| **Pagination** | News sites with page numbers | Medium |
-| **Category** | Sites with topic categories | Medium |
-| **Deep BFS** | Comprehensive coverage | Slow |
-| **Deep DFS** | Following content chains | Slow |
-
 ---
 
 ## Usage Examples
@@ -423,7 +353,7 @@ Choose the best strategy for your target:
 4. Review recommended strategy (likely "Sitemap")
 5. Set max pages: `500`
 6. Click **Start Crawling**
-7. Wait for completion (~2-5 minutes)
+7. Wait for completion (*may take hours*)
 
 ### Example 2: Extract Metadata with LLM
 
@@ -456,9 +386,9 @@ Choose the best strategy for your target:
 
 ### Crawling
 
-- **Stay on page**: Navigating away interrupts the crawl
+- **Stay on page**: Navigating away interrupts the crawl, do other tasks while leaving the tab open.
 - **Rate limiting**: Some sites may block aggressive crawling
-- **Respect robots.txt**: Be a good web citizen
+- **Respect robots.txt**: Be a good web citizen!
 
 ### Processing
 
