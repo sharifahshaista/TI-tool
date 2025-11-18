@@ -1,12 +1,16 @@
 """
 LlamaIndex RAG with Persistent Vector Storage
 Handles embedding generation, storage, and retrieval using LlamaIndex.
+Supports S3 backup for embeddings persistence.
 """
 
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import shutil
+import tempfile
+import logging
 
 from llama_index.core import (
     VectorStoreIndex,
@@ -17,43 +21,206 @@ from llama_index.core import (
 )
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
+
+# Import Azure OpenAI embeddings
+try:
+    from llama_index.embeddings.azure_openai import AzureOpenAIEmbedding
+except ImportError:
+    AzureOpenAIEmbedding = None
+    print("Warning: AzureOpenAIEmbedding import failed")
+
+# Try to import AzureOpenAI - handle both old and new module paths
+try:
+    from llama_index.llms.azure_openai import AzureOpenAI
+except ImportError:
+    try:
+        # Try newer import path
+        from llama_index.llms.openai import AzureOpenAI
+    except ImportError:
+        # Fallback - will use OpenAI instead
+        AzureOpenAI = None
+        print("Warning: AzureOpenAI import failed, will use OpenAI instead")
+
 from dotenv import load_dotenv
 import os
 
 # Load environment variables
 load_dotenv()
 
+# Setup logging
+logger = logging.getLogger(__name__)
+
+# Import S3 storage (optional - gracefully handle if not configured)
+try:
+    from aws_storage import S3Storage
+    HAS_S3 = True
+except ImportError:
+    HAS_S3 = False
+    logger.warning("S3 storage not available - embeddings will only be stored locally")
+
 
 class LlamaIndexRAG:
-    """RAG system using LlamaIndex with persistent storage."""
+    """RAG system using LlamaIndex with persistent storage.
+    
+    Supports Azure OpenAI for both embeddings and text generation.
+    """
     
     def __init__(
         self,
         persist_dir: str = "rag_storage",
-        embedding_model: str = "text-embedding-3-small",
-        llm_model: str = "gpt-4o-mini"
+        embedding_model: str = "text-embedding-3-large",
+        llm_provider: str = "azure_openai",  # "azure_openai", "openai", or "lm_studio"
+        llm_model: str = "gpt-4o-mini",
+        lm_studio_base_url: str = "http://127.0.0.1:1234/v1",
+        azure_deployment: str = None,  # Azure deployment name for LLM
+        azure_api_version: str = "2024-02-15-preview",
+        use_azure_embeddings: bool = True,  # Use Azure OpenAI for embeddings
+        enable_s3_sync: bool = True  # Enable automatic S3 sync for embeddings
     ):
         """
         Initialize RAG system with LlamaIndex.
         
         Args:
             persist_dir: Directory to persist vector index
-            embedding_model: OpenAI embedding model name
-            llm_model: OpenAI LLM model name
+            embedding_model: Embedding model name (Azure deployment name if use_azure_embeddings=True)
+            llm_provider: LLM provider - "azure_openai", "openai", or "lm_studio"
+            llm_model: LLM model name
+            lm_studio_base_url: Base URL for LM Studio API (if using lm_studio)
+            azure_deployment: Azure OpenAI deployment name for LLM (if using azure_openai)
+            azure_api_version: Azure OpenAI API version
+            use_azure_embeddings: Use Azure OpenAI for embeddings (default: True)
+            enable_s3_sync: Enable automatic S3 sync for embeddings (default: True)
         """
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self.llm_provider = llm_provider
+        self.use_azure_embeddings = use_azure_embeddings
+        self.enable_s3_sync = enable_s3_sync and HAS_S3
         
-        # Configure LlamaIndex settings
-        Settings.embed_model = OpenAIEmbedding(
-            model=embedding_model,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
-        Settings.llm = OpenAI(
-            model=llm_model,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        # Initialize S3 storage if enabled
+        self.s3_storage = None
+        if self.enable_s3_sync:
+            try:
+                self.s3_storage = S3Storage()
+                logger.info("✓ S3 sync enabled for RAG embeddings")
+            except Exception as e:
+                logger.warning(f"S3 storage initialization failed: {e}. Falling back to local-only storage.")
+                self.enable_s3_sync = False
         
+        # Configure embeddings
+        if use_azure_embeddings:
+            # Use Azure OpenAI for embeddings
+            if not AzureOpenAIEmbedding:
+                raise ImportError(
+                    "AzureOpenAIEmbedding is not available. "
+                    "Please install: pip install llama-index-embeddings-azure-openai"
+                )
+            
+            azure_embedding_api_key = os.getenv("AZURE_OPENAI_EMBEDDING_API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
+            azure_embedding_endpoint = os.getenv("AZURE_OPENAI_EMBEDDING_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
+            azure_embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", embedding_model)
+            azure_embedding_version = os.getenv("AZURE_OPENAI_EMBEDDING_API_VERSION", "2024-02-15-preview")
+            
+            if not azure_embedding_api_key or not azure_embedding_endpoint:
+                raise ValueError(
+                    "Azure OpenAI embeddings configuration missing. "
+                    "Please set AZURE_OPENAI_EMBEDDING_API_KEY and AZURE_OPENAI_EMBEDDING_ENDPOINT in your .env file."
+                )
+            
+            # Use AzureOpenAIEmbedding class for Azure
+            Settings.embed_model = AzureOpenAIEmbedding(
+                model=azure_embedding_deployment,
+                deployment_name=azure_embedding_deployment,
+                api_key=azure_embedding_api_key,
+                azure_endpoint=azure_embedding_endpoint,
+                api_version=azure_embedding_version
+            )
+            print(f"✓ Using Azure OpenAI embeddings: {azure_embedding_deployment}")
+            print(f"  Endpoint: {azure_embedding_endpoint}")
+            print(f"  API Version: {azure_embedding_version}")
+        else:
+            # Use standard OpenAI for embeddings
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            
+            if not openai_api_key or (not openai_api_key.startswith("sk-") and not openai_api_key.startswith("sk-proj-")):
+                raise ValueError(
+                    "Valid OPENAI_API_KEY is required for embeddings. "
+                    "Please set a real OpenAI API key in your .env file."
+                )
+            
+            Settings.embed_model = OpenAIEmbedding(
+                model=embedding_model,
+                api_key=openai_api_key
+            )
+            print(f"✓ Using OpenAI embeddings: {embedding_model}")
+        
+        # Configure LLM based on provider
+        if llm_provider == "azure_openai":
+            # Use Azure OpenAI for generation
+            if not AzureOpenAI:
+                raise ImportError("AzureOpenAI not available. Please install llama-index-llms-azure-openai")
+            
+            # Get Azure configuration - prioritize chat deployment, then general deployment
+            azure_llm_deployment = (
+                azure_deployment or 
+                os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME") or 
+                os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or
+                llm_model
+            )
+            azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+            azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+            
+            if not azure_api_key or not azure_endpoint:
+                raise ValueError(
+                    "Azure OpenAI configuration missing. "
+                    "Please set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT in your .env file."
+                )
+            
+            Settings.llm = AzureOpenAI(
+                model=llm_model,
+                deployment_name=azure_llm_deployment,
+                api_key=azure_api_key,
+                azure_endpoint=azure_endpoint,
+                api_version=azure_api_version,
+                temperature=0.7
+            )
+            self.llm_model_name = azure_llm_deployment
+            print(f"✓ Using Azure OpenAI LLM: {self.llm_model_name}")
+            print(f"  Endpoint: {azure_endpoint}")
+            print(f"  API Version: {azure_api_version}")
+        elif llm_provider == "lm_studio":
+            # Use LM Studio for generation
+            # Store original key
+            original_openai_key = os.getenv("OPENAI_API_KEY", "")
+            
+            # LM Studio uses OpenAI-compatible API, so we use OpenAI class
+            # but point it to local server
+            # Temporarily set a dummy API key for LM Studio (won't be validated by local server)
+            os.environ["OPENAI_API_KEY"] = "sk-111111111111111111111111111111111111111111111111"
+            
+            Settings.llm = OpenAI(
+                model=llm_model,
+                api_base=lm_studio_base_url,
+                temperature=0.7,
+                request_timeout=120.0,
+                max_retries=0  # Don't retry on LM Studio
+            )
+            
+            # Restore original key
+            if original_openai_key:
+                os.environ["OPENAI_API_KEY"] = original_openai_key
+            
+            self.llm_model_name = llm_model
+            print(f"✓ Using LM Studio LLM: {self.llm_model_name}")
+        else:
+            # Use OpenAI for generation
+            Settings.llm = OpenAI(
+                model=llm_model,
+                api_key=original_openai_key
+            )
+            self.llm_model_name = llm_model
+        
+        self.embedding_model_name = embedding_model
         self.index: Optional[VectorStoreIndex] = None
         self.current_index_name: Optional[str] = None
         self.loaded_indexes: Dict[str, VectorStoreIndex] = {}  # Support multiple loaded indexes
@@ -95,6 +262,126 @@ class LlamaIndexRAG:
         
         return intent
 
+    def _upload_index_to_s3(self, index_name: str) -> bool:
+        """
+        Upload persisted index directory to S3.
+        
+        Args:
+            index_name: Name of the index (folder name)
+            
+        Returns:
+            bool: True if successful
+        """
+        if not self.enable_s3_sync or not self.s3_storage:
+            return False
+        
+        try:
+            index_dir = self.persist_dir / index_name
+            if not index_dir.exists():
+                logger.error(f"Index directory not found: {index_dir}")
+                return False
+            
+            # Create a temporary zip file of the index
+            temp_zip = tempfile.NamedTemporaryFile(suffix='.zip', delete=False)
+            temp_zip_path = temp_zip.name
+            temp_zip.close()
+            
+            # Zip the index directory
+            shutil.make_archive(temp_zip_path.replace('.zip', ''), 'zip', index_dir)
+            
+            # Upload to S3
+            s3_key = f"rag_embeddings/{index_name}.zip"
+            success = self.s3_storage.upload_file(
+                temp_zip_path,
+                s3_key,
+                metadata={
+                    'index_name': index_name,
+                    'created_at': datetime.now().isoformat()
+                }
+            )
+            
+            # Cleanup temp file
+            Path(temp_zip_path).unlink(missing_ok=True)
+            
+            if success:
+                logger.info(f"✓ Index '{index_name}' uploaded to S3: {s3_key}")
+            else:
+                logger.error(f"✗ Failed to upload index '{index_name}' to S3")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error uploading index to S3: {e}")
+            return False
+    
+    def _download_index_from_s3(self, index_name: str) -> bool:
+        """
+        Download persisted index from S3 to local storage.
+        
+        Args:
+            index_name: Name of the index (folder name)
+            
+        Returns:
+            bool: True if successful
+        """
+        if not self.enable_s3_sync or not self.s3_storage:
+            return False
+        
+        try:
+            s3_key = f"rag_embeddings/{index_name}.zip"
+            
+            # Check if index exists in S3
+            if not self.s3_storage.file_exists(s3_key):
+                logger.info(f"Index '{index_name}' not found in S3")
+                return False
+            
+            # Create temp file for download
+            temp_zip = tempfile.NamedTemporaryFile(suffix='.zip', delete=False)
+            temp_zip_path = temp_zip.name
+            temp_zip.close()
+            
+            # Download from S3
+            success = self.s3_storage.download_file(s3_key, temp_zip_path)
+            if not success:
+                logger.error(f"Failed to download index from S3")
+                Path(temp_zip_path).unlink(missing_ok=True)
+                return False
+            
+            # Extract zip to local persist directory
+            index_dir = self.persist_dir / index_name
+            index_dir.mkdir(parents=True, exist_ok=True)
+            
+            shutil.unpack_archive(temp_zip_path, index_dir, 'zip')
+            
+            # Cleanup temp file
+            Path(temp_zip_path).unlink(missing_ok=True)
+            
+            logger.info(f"✓ Index '{index_name}' downloaded from S3 and extracted")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error downloading index from S3: {e}")
+            return False
+    
+    def list_s3_indexes(self) -> List[str]:
+        """
+        List all available indexes in S3.
+        
+        Returns:
+            List of index names
+        """
+        if not self.enable_s3_sync or not self.s3_storage:
+            return []
+        
+        try:
+            files = self.s3_storage.list_files(prefix="rag_embeddings/", suffix=".zip")
+            # Extract index names from file paths
+            index_names = [Path(f).stem for f in files]
+            return index_names
+        except Exception as e:
+            logger.error(f"Error listing S3 indexes: {e}")
+            return []
+
     
     def build_index_from_json(
         self,
@@ -104,6 +391,7 @@ class LlamaIndexRAG:
     ) -> int:
         """
         Build or load vector index from JSON file.
+        Automatically syncs with S3 if enabled.
         
         Args:
             json_path: Path to summarized JSON file
@@ -117,12 +405,12 @@ class LlamaIndexRAG:
         index_name = json_path.stem  # Use JSON filename as index identifier
         index_dir = self.persist_dir / index_name
         
-        # Check if index already exists
+        # Check if index already exists locally
         if index_dir.exists() and not force_rebuild:
             try:
-                # Load existing index
+                # Load existing local index
                 if progress_callback:
-                    progress_callback("Loading existing index...", 0, 1)
+                    progress_callback("Loading existing local index...", 0, 1)
                 
                 storage_context = StorageContext.from_defaults(
                     persist_dir=str(index_dir)
@@ -138,7 +426,30 @@ class LlamaIndexRAG:
                 
                 return doc_count
             except Exception as e:
-                print(f"Failed to load existing index: {e}. Rebuilding...")
+                logger.warning(f"Failed to load local index: {e}. Checking S3...")
+        
+        # Try to download from S3 if not found locally
+        if not index_dir.exists() and self.enable_s3_sync and not force_rebuild:
+            if progress_callback:
+                progress_callback("Checking S3 for existing index...", 0, 1)
+            
+            if self._download_index_from_s3(index_name):
+                try:
+                    # Load downloaded index
+                    storage_context = StorageContext.from_defaults(
+                        persist_dir=str(index_dir)
+                    )
+                    self.index = load_index_from_storage(storage_context)
+                    self.current_index_name = index_name
+                    
+                    doc_count = len(storage_context.docstore.docs)
+                    
+                    if progress_callback:
+                        progress_callback(f"Loaded index from S3 with {doc_count} documents", doc_count, doc_count)
+                    
+                    return doc_count
+                except Exception as e:
+                    logger.warning(f"Failed to load index from S3: {e}. Rebuilding...")
         
         # Build new index
         if progress_callback:
@@ -159,7 +470,7 @@ class LlamaIndexRAG:
                 'title': article.get('title') or article.get('Title') or article.get('headline') or '',
                 'url': article.get('url') or article.get('link') or '',
                 'filename': article.get('filename') or article.get('file') or article.get('file_name') or '',
-                'date': article.get('date') or article.get('Date') or article.get('pubDate') or '',
+                'publication_date': article.get('publication_date') or article.get('date') or article.get('Date') or article.get('pubDate') or '',
                 'dimension': article.get('Dimension') or article.get('dimension') or '',
                 'tech': article.get('Tech') or article.get('tech') or '',
                 'trl': str(article.get('TRL') or article.get('trl') or ''),
@@ -207,9 +518,21 @@ class LlamaIndexRAG:
                 'source_file': str(json_path),
                 'num_documents': len(documents),
                 'created_at': datetime.now().isoformat(),
-                'embedding_model': Settings.embed_model.model_name,
-                'llm_model': Settings.llm.model,
+                'embedding_model': self.embedding_model_name,
+                'llm_provider': self.llm_provider,
+                'llm_model': self.llm_model_name,
             }, f, indent=2)
+        
+        # Upload to S3 if enabled
+        if self.enable_s3_sync:
+            if progress_callback:
+                progress_callback("Uploading index to S3...", total, total)
+            
+            upload_success = self._upload_index_to_s3(index_name)
+            if upload_success:
+                logger.info(f"✓ Index successfully backed up to S3")
+            else:
+                logger.warning(f"⚠ Index built locally but S3 upload failed")
         
         if progress_callback:
             progress_callback(f"Index built and saved with {len(documents)} documents", total, total)
@@ -356,34 +679,62 @@ class LlamaIndexRAG:
     
     def get_available_indexes(self) -> List[Dict[str, Any]]:
         """
-        Get list of available persisted indexes.
+        Get list of available persisted indexes from local storage and S3.
         
         Returns:
             List of index metadata dictionaries
         """
         indexes = []
+        seen_names = set()
         
-        if not self.persist_dir.exists():
-            return indexes
+        # Get local indexes
+        if self.persist_dir.exists():
+            for index_dir in self.persist_dir.iterdir():
+                if index_dir.is_dir():
+                    metadata_file = index_dir / "metadata.json"
+                    if metadata_file.exists():
+                        try:
+                            with open(metadata_file, 'r') as f:
+                                metadata = json.load(f)
+                            metadata['index_name'] = index_dir.name
+                            metadata['index_path'] = str(index_dir)
+                            metadata['location'] = 'local'
+                            indexes.append(metadata)
+                            seen_names.add(index_dir.name)
+                        except Exception as e:
+                            logger.warning(f"Failed to load metadata for {index_dir.name}: {e}")
         
-        for index_dir in self.persist_dir.iterdir():
-            if index_dir.is_dir():
-                metadata_file = index_dir / "metadata.json"
-                if metadata_file.exists():
+        # Get S3 indexes (only those not already in local)
+        if self.enable_s3_sync:
+            s3_index_names = self.list_s3_indexes()
+            for s3_name in s3_index_names:
+                if s3_name not in seen_names:
+                    # Get metadata from S3 if available
+                    metadata = {
+                        'index_name': s3_name,
+                        'location': 's3',
+                        'created_at': 'unknown',
+                        'num_documents': 'unknown'
+                    }
+                    
+                    # Try to get S3 file metadata
                     try:
-                        with open(metadata_file, 'r') as f:
-                            metadata = json.load(f)
-                        metadata['index_name'] = index_dir.name
-                        metadata['index_path'] = str(index_dir)
-                        indexes.append(metadata)
+                        s3_key = f"rag_embeddings/{s3_name}.zip"
+                        file_meta = self.s3_storage.get_file_metadata(s3_key)
+                        if file_meta:
+                            metadata['created_at'] = file_meta['last_modified'].isoformat()
+                            metadata['size'] = file_meta['size']
                     except Exception as e:
-                        print(f"Failed to load metadata for {index_dir.name}: {e}")
+                        logger.debug(f"Could not get S3 metadata for {s3_name}: {e}")
+                    
+                    indexes.append(metadata)
         
         return sorted(indexes, key=lambda x: x.get('created_at', ''), reverse=True)
     
     def load_index(self, index_name: str) -> int:
         """
         Load a specific persisted index.
+        Automatically downloads from S3 if not found locally.
         
         Args:
             index_name: Name of the index directory
@@ -393,8 +744,15 @@ class LlamaIndexRAG:
         """
         index_dir = self.persist_dir / index_name
         
+        # Try local first
         if not index_dir.exists():
-            raise ValueError(f"Index '{index_name}' not found")
+            # Try downloading from S3
+            if self.enable_s3_sync:
+                logger.info(f"Index '{index_name}' not found locally. Attempting S3 download...")
+                if not self._download_index_from_s3(index_name):
+                    raise ValueError(f"Index '{index_name}' not found locally or in S3")
+            else:
+                raise ValueError(f"Index '{index_name}' not found")
         
         storage_context = StorageContext.from_defaults(
             persist_dir=str(index_dir)
@@ -407,18 +765,34 @@ class LlamaIndexRAG:
         
         return doc_count
     
-    def delete_index(self, index_name: str):
-        """Delete a persisted index."""
+    def delete_index(self, index_name: str, delete_from_s3: bool = True):
+        """
+        Delete a persisted index from local storage and optionally S3.
+        
+        Args:
+            index_name: Name of the index to delete
+            delete_from_s3: If True, also delete from S3 (default: True)
+        """
         index_dir = self.persist_dir / index_name
         
+        # Delete local copy
         if index_dir.exists():
-            import shutil
             shutil.rmtree(index_dir)
+            logger.info(f"✓ Deleted local index: {index_name}")
+            
             if self.current_index_name == index_name:
                 self.index = None
                 self.current_index_name = None
             if index_name in self.loaded_indexes:
                 del self.loaded_indexes[index_name]
+        
+        # Delete from S3
+        if delete_from_s3 and self.enable_s3_sync:
+            s3_key = f"rag_embeddings/{index_name}.zip"
+            if self.s3_storage.delete_file(s3_key):
+                logger.info(f"✓ Deleted S3 index: {index_name}")
+            else:
+                logger.warning(f"⚠ Failed to delete S3 index: {index_name}")
     
     def load_multiple_indexes(self, index_names: List[str]) -> Dict[str, int]:
         """

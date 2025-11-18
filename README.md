@@ -1,20 +1,28 @@
 # TI-tool
 This is a prototype tool to complement technology intelligence.
 
+## 🚀 Quick Links
+
+- **[Quick Deploy (15 min)](QUICK_DEPLOY.md)** - Fast deployment to Streamlit Cloud
+- **[Streamlit Cloud Deployment Guide](STREAMLIT_CLOUD_DEPLOYMENT.md)** - Complete cloud deployment docs
+- **[AWS Deployment Guide](deployment/AWS_DEPLOYMENT_GUIDE.md)** - Self-hosted AWS EC2 option
+- **[Deployment Checklist](DEPLOYMENT_CHECKLIST.md)** - Pre-deployment verification
+
 ## Overview
 
 TI Agent is a comprehensive Streamlit application that automates the entire workflow of technology intelligence gathering:
 
 1. **Web Search** - AI-assisted research with clarification and SERP generation
-2. **Web Crawler** - Intelligent website crawling with multiple strategies
-3. **Post-Processing** - Extract structured metadata from crawled content
+2. **Web Crawler** - Intelligent website crawling with URL filtering
+3. **LLM Extraction** - Extract structured metadata from crawled content using AI
 4. **Summarization** - AI-powered tech-intelligence analysis and categorization
 5. **Database** - Consolidated searchable database with advanced filtering
 6. **RAG Chatbot** - Query your knowledge base with AI-powered citations
+7. **LinkedIn Monitor** - Track LinkedIn posts (optional feature)
 
 ---
 
-## Quick Start
+## 🎯 Quick Start (Local Development)
 
 ### Prerequisites
 
@@ -24,14 +32,14 @@ TI Agent is a comprehensive Streamlit application that automates the entire work
   - OpenAI API key, OR
   - LM Studio running locally with a model loaded
 - SearXNG instance (for web search)
-- Crawl4AI instance (for web crawling)
+- AWS S3 bucket (for persistent storage)
 
 ### Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/sharifahshaista/TI-tool.git
-cd TI-agent
+git clone <repository-url>
+cd TI-tool
 
 # Create virtual environment
 python -m venv .venv
@@ -42,7 +50,7 @@ pip install -r requirements.txt
 
 # Set up environment variables
 cp .env.example .env
-# Edit .env with your API keys and LLM provider choice
+# Edit .env with your API keys and configuration
 ```
 
 ### LLM Provider Configuration
@@ -84,11 +92,36 @@ LM_STUDIO_API_KEY=lm-studio
 
 ### Required Environment Variables
 
+Create `.streamlit/secrets.toml` (for Streamlit Cloud) or `.env` (for local):
+
+```toml
+[LLM_PROVIDER]
+PROVIDER = "azure"
+
+[AZURE_OPENAI]
+AZURE_OPENAI_API_KEY = "your-azure-api-key"
+AZURE_OPENAI_ENDPOINT = "https://your-resource.openai.azure.com/"
+AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-4o-mini"
+AZURE_OPENAI_API_VERSION = "2024-02-15-preview"
+
+[AWS]
+AWS_ACCESS_KEY_ID = "your-access-key-id"
+AWS_SECRET_ACCESS_KEY = "your-secret-access-key"
+AWS_DEFAULT_REGION = "us-east-1"
+S3_BUCKET_NAME = "ti-tool-s3-storage"
+
+[SEARXNG]
+SEARXNG_URL = "http://your-searxng-instance:8080"
+```
+
+**For local development with `.env`:**
 ```bash
-OPENAI_API_KEY=your_openai_key # Used for embeddings
 AZURE_OPENAI_API_KEY=your_azure_key
 AZURE_OPENAI_ENDPOINT=your_azure_endpoint
-AZURE_OPENAI_API_VERSION=2024-02-15-preview
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+S3_BUCKET_NAME=ti-tool-s3-storage
+SEARXNG_URL=http://localhost:8080
 ```
 
 Start SearXNG instance:
@@ -116,58 +149,88 @@ Navigate to `http://localhost:8501` in your browser.
 
 ---
 
+## ☁️ Cloud Deployment
+
+### Streamlit Community Cloud (Recommended for PoC)
+
+**Free tier**: 1 private app, unlimited public apps
+
+See **[STREAMLIT_CLOUD_DEPLOYMENT.md](STREAMLIT_CLOUD_DEPLOYMENT.md)** for complete deployment instructions.
+
+**Quick steps:**
+1. Create AWS S3 bucket for storage
+2. Push code to GitHub
+3. Deploy on [share.streamlit.io](https://share.streamlit.io/)
+4. Add secrets in Streamlit Cloud settings
+5. Done! ✨
+
+### AWS EC2 (Production Deployment)
+
+For self-hosted production environments with full control.
+
+See **[deployment/AWS_DEPLOYMENT_GUIDE.md](deployment/AWS_DEPLOYMENT_GUIDE.md)** for detailed instructions.
+
+---
+
 ## Project Structure
 
 ```
-TI-agent/
-├── app.py                      # Main Streamlit application
-├── embeddings_rag.py           # LlamaIndex RAG system with persistence
-├── embeddings_demo.py          # Embedding utilities
-├── requirements.txt            # Python dependencies
-├── .env                        # Environment variables (create from .env.example)
+TI-tool/
+├── app.py                          # Main Streamlit application
+├── aws_storage.py                  # S3 storage integration
+├── embeddings_rag.py               # LlamaIndex RAG system
+├── requirements.txt                # Python dependencies
+├── packages.txt                    # System dependencies (for Streamlit Cloud)
+├── .streamlit/
+│   ├── config.toml                 # Streamlit configuration
+│   └── secrets.toml.example        # Secrets template
 │
-├── agents/                     # AI agents and processors
-│   ├── clarification.py        # Research clarification agent
-│   ├── serp.py                 # SERP query generation
-│   ├── learn.py                # Learning extraction agent
-│   ├── web_crawler.py          # Multi-strategy web crawler
-│   ├── markdown_post_processor.py  # Metadata extraction
-│   ├── summarise_csv.py        # Tech-intelligence summarizer
+├── STREAMLIT_CLOUD_DEPLOYMENT.md   # Cloud deployment guide
+├── README.md                       # This file
+│
+├── agents/                         # AI agents and processors
+│   ├── clarification.py            # Research clarification agent
+│   ├── serp.py                     # SERP query generation
+│   ├── learn.py                    # Learning extraction agent
+│   ├── web_crawler.py              # Multi-strategy web crawler
+│   ├── summarise_csv.py            # Tech-intelligence summarizer
 │   └── crawl_strategy_detector.py  # Auto-detect best crawl strategy
 │
-├── config/                     # Configuration modules
-│   ├── model_config.py         # LLM provider configuration
-│   └── searxng_tools.py        # SearXNG integration
+├── config/                         # Configuration modules
+│   ├── model_config.py             # LLM provider configuration
+│   └── searxng_tools.py            # SearXNG integration
 │
-├── schemas/                    # Pydantic data models
-│   └── datamodel.py            # Data schemas and validation
+├── schemas/                        # Pydantic data models
+│   └── datamodel.py                # Data schemas and validation
 │
-├── data/                       # Research pipeline outputs
-│   ├── *.json                  # Search results
-│   └── *.md                    # Learning reports
+├── webcrawler/                     # Web crawler modules
+│   ├── scraper.py                  # Core scraping logic
+│   ├── url_utils.py                # URL utilities
+│   └── content_extractor.py        # Content extraction
 │
-├── crawled_data/               # Web crawler outputs
-│   └── {website}/              # One folder per crawled site
-│       ├── *.md                # Markdown content
-│       ├── csv/                # CSV exports
-│       └── json/               # JSON exports
+├── deployment/                     # Deployment guides
+│   ├── AWS_DEPLOYMENT_GUIDE.md     # EC2 deployment
+│   ├── QUICK_START.md              # Quick start guide
+│   └── setup_ec2.sh                # EC2 setup script
 │
-├── processed_data/             # Post-processed data
-│   └── {website}_{date}.csv/json
-│
-├── summarised_content/         # Tech-intelligence summaries
-│   ├── {website}_{date}.csv    # Summarized articles
-│   ├── {website}_{date}.json   # JSON format
-│   ├── {website}_{date}_log.txt # Processing logs
-│   └── history.json            # Processing history
-│
-└── rag_storage/                # Persistent vector embeddings
-    └── {source}_{date}/        # One index per data source
-        ├── docstore.json       # Document storage
-        ├── index_store.json    # Index metadata
-        ├── vector_store.json   # Vector embeddings
-        └── metadata.json       # Custom metadata
+└── S3 Storage (crawled_data/, processed_data/, summarised_content/, rag_storage/)
+    # All data stored in AWS S3 bucket for persistence
 ```
+
+### Storage Architecture
+
+This application uses **AWS S3** for persistent storage instead of local filesystem:
+
+- **crawled_data/**: Raw crawled website data
+- **processed_data/**: Filtered and processed URLs
+- **summarised_content/**: AI-generated summaries and analysis
+- **rag_storage/**: Vector embeddings for RAG chatbot
+
+**Benefits:**
+- ✅ Works on Streamlit Cloud (stateless containers)
+- ✅ Data persists across deployments
+- ✅ Accessible from anywhere
+- ✅ Automatic backups and versioning
 
 ---
 
@@ -182,6 +245,9 @@ TI-agent/
 
 ### 2. Web Crawler
 
+**Two-tab interface combining crawling and URL filtering:**
+
+#### Tab 1: Crawl Websites
 - **Automatically determine** the optimal strategy to scrape websites from the user's input, chosen from six strategies. Users can manually select crawling strategy as well.
 
    * **Simple Discovery**  
@@ -208,27 +274,33 @@ TI-agent/
      > Uses DFS traversal algorithm
      > Suitable for content chains and focused explorations.
 
- - **Crawls** websites using [Crawl4AI](https://docs.crawl4ai.com/). Each website page is saved as markdown files. Crawled data also exportable as CSV and JSON.
+ - **Crawls** websites using [Crawl4AI](https://docs.crawl4ai.com/). Results saved to S3 in CSV format.
 
+#### Tab 2: Filter URLs
+- Remove unwanted URLs from crawled data
+- Customizable filter patterns (e.g., `/about`, `/author`, `/contact`)
+- Preview filtered results before saving
+- Saves filtered data to `processed_data/` in S3
 
-### 3. Post-processing
-1. Extracts the following metadata from each markdown file from crawled data folder and saves into CSV/JSON:
+### 3. LLM Extraction
+Use AI models to intelligently extract structured metadata from markdown files:
    * Title
    * Publication Date
    * URL
    * Main Content
    * Author
    * Tags/Categories
-2. AI pattern detection is integrated to recognise regular expressions of the abovementioned metadata as well as to filter out noise in each markdown file.
-   * *If disabled, the processing uses references from preset post-processing approaches for Canary Media, Carbon Capture Magazine, Cleantechnica, Cool Coalition and ThinkGeoEnergy.*
+   * Custom fields as needed
 
 ### 4. Summarisation 
-Pass the 'Main Content' data from post-processing to perform summarisation and classification.
-   * Indicator: A concise summary focusing on the key technological development, event, or trend described.
-   * Dimension: Primary category from tech, policy, economic, environmental & safety, social & ethical, legal & regulatory.
-   * Tech: Specific technology domain or sector.
-   * TRL: Technology Readiness Level (1-9 scale).
-   * Start-up: If the news is about a start-up, the URL to the start-up's official webpage is included.
+Upload or select processed CSV files from S3 to perform summarization and classification:
+   * **Indicator**: A concise summary focusing on the key technological development, event, or trend described.
+   * **Dimension**: Primary category from tech, policy, economic, environmental & safety, social & ethical, legal & regulatory.
+   * **Tech**: Specific technology domain or sector.
+   * **TRL**: Technology Readiness Level (1-9 scale).
+   * **Start-up**: If the news is about a start-up, the URL to the start-up's official webpage is included.
+
+Results saved to `summarised_content/` in S3.
 
 ### 5. Database
 
@@ -258,11 +330,11 @@ https://github.com/user-attachments/assets/813787e0-2526-40b6-a148-da4eb46a82bc
    ↓
    Save markdown files
 
-2. Post-Processing
+2. LLM Extraction
    ↓
    Extract structured metadata
    ↓
-   Save to processed_data/
+   Save to processed files
 
 3. Summarization
    ↓
@@ -353,13 +425,13 @@ Choose the best strategy for your target:
 6. Click **Start Crawling**
 7. Wait for completion (~2-5 minutes)
 
-### Example 2: Process Crawled Content
+### Example 2: Extract Metadata with LLM
 
-1. Go to **Post-Processing** → **Quick Start**
-2. Select preset: "Canary Media"
-3. Select folder: `canarymedia`
-4. Click **Start Quick Processing**
-5. Files saved to `processed_data/canarymedia_20251029.csv`
+1. Go to **LLM Extraction**
+2. Select folder: `canarymedia`
+3. Configure extraction fields
+4. Click **Start Extraction**
+5. Files saved to extraction output folder
 
 ### Example 3: Generate Tech Intelligence
 

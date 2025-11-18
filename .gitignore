@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Streamlit Secrets
+.streamlit/secrets.toml
+
 # Python
 __pycache__/
 *.py[cod]

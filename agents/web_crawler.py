@@ -9,6 +9,7 @@ Features:
 - Builtin browser mode for better performance
 - Real-time progress tracking
 - Streaming support
+- S3 storage integration for data persistence
 """
 
 import asyncio
@@ -49,6 +50,13 @@ from crawl4ai.deep_crawling.filters import (
     ContentTypeFilter
 )
 from crawl4ai.deep_crawling.scorers import KeywordRelevanceScorer
+
+# Import S3 storage
+try:
+    from aws_storage import get_storage
+    HAS_S3_STORAGE = True
+except ImportError:
+    HAS_S3_STORAGE = False
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.content_filter_strategy import PruningContentFilter
 
@@ -81,6 +89,41 @@ class EnhancedWebCrawler:
     """
     Enhanced web crawler with deep crawl, filtering, and virtual scroll support
     """
+    
+    # URL patterns to exclude - focuses crawler on news/articles/blogs
+    EXCLUDE_URL_PATTERNS = [
+        # Navigation and utility pages
+        'about-us', 'about', 'aboutus',
+        'contact-us', 'contact', 'contactus',
+        'faq', 'faqs', 'frequently-asked',
+        'author', 'authors', 'writer', 'writers',
+        'team', 'staff', 'people',
+        
+        # Commercial/marketing pages  
+        'advertisement', 'advertise', 'advertising', 'ads',
+        'sponsor', 'partners', 'partnership',
+        'careers', 'jobs', 'employment',
+        'subscribe', 'subscription', 'newsletter',
+        'shop', 'store', 'product', 'products',
+        'pricing', 'plans',
+        
+        # Legal/policy pages
+        'privacy', 'privacy-policy', 'cookie-policy',
+        'terms', 'terms-of-service', 'terms-and-conditions',
+        'legal', 'disclaimer', 'dmca',
+        
+        # Technical/admin pages
+        'login', 'signin', 'signup', 'register',
+        'account', 'profile', 'dashboard',
+        'search', 'sitemap',
+        'feed', 'rss', 'atom',
+        
+        # Media/file extensions
+        '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.svg',
+        '.mp4', '.mp3', '.avi', '.mov',
+        '.zip', '.rar', '.tar', '.gz',
+        '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+    ]
     
     def __init__(self, start_url: str, output_dir: str = "crawled_data/saved_md", strip_links: bool = True):
         self.start_url = start_url
@@ -121,12 +164,140 @@ class EnhancedWebCrawler:
             # Don't break crawl on logging issues
             pass
     
+    def _should_exclude_url(self, url: str) -> bool:
+        """
+        Check if a URL should be excluded from crawling.
+        Returns True if URL matches any exclusion pattern.
+        
+        This method uses path segment analysis to avoid false positives
+        (e.g., excludes '/about' but not '/news/about-climate-change')
+        
+        Args:
+            url: The URL to check
+            
+        Returns:
+            bool: True if URL should be excluded, False otherwise
+        """
+        url_lower = url.lower()
+        parsed = urlparse(url)
+        
+        # Keep the homepage
+        if not parsed.path or parsed.path == '/':
+            return False
+        
+        # Extract path segments for more accurate matching
+        path = parsed.path.strip('/')
+        path_segments = [seg for seg in path.split('/') if seg]
+        
+        # File extension check (highest priority)
+        file_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.svg',
+                          '.mp4', '.mp3', '.avi', '.mov',
+                          '.zip', '.rar', '.tar', '.gz',
+                          '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+                          '.xml']  # Include .xml for sitemap files
+        for ext in file_extensions:
+            if url_lower.endswith(ext):
+                return True
+        
+        # Check for exclusion patterns as path segments or exact matches
+        # This prevents false positives like "about-climate-change" matching "about"
+        exclude_segments = [
+            'about-us', 'aboutus',
+            'contact-us', 'contactus',
+            'faq', 'faqs', 'frequently-asked',
+            'author', 'authors', 'writer', 'writers',
+            'team', 'staff', 'people',
+            'advertisement', 'advertise', 'advertising', 'ads',
+            'sponsor', 'partners', 'partnership',
+            'careers', 'jobs', 'employment',
+            'subscribe', 'subscription', 'newsletter',
+            'shop', 'store', 'product', 'products',
+            'pricing', 'plans',
+            'privacy', 'privacy-policy', 'cookie-policy',
+            'terms', 'terms-of-service', 'terms-and-conditions',
+            'legal', 'disclaimer', 'dmca',
+            'login', 'signin', 'signup', 'register',
+            'account', 'profile', 'dashboard',
+            'search', 'sitemap',
+            'feed', 'rss', 'atom',
+            'category', 'categories', 'tag', 'tags',
+            'archive', 'archives'
+        ]
+        
+        # Check if any path segment exactly matches an exclusion pattern
+        for segment in path_segments:
+            if segment in exclude_segments:
+                return True
+        
+        # Check for numeric-only segments (often pagination like /page/2)
+        # Exclude if a segment is purely numeric and follows 'page' or is standalone
+        for i, segment in enumerate(path_segments):
+            if segment.isdigit():
+                # If it's the only segment or follows 'page', exclude it
+                if len(path_segments) == 1 or (i > 0 and path_segments[i-1] in ['page', 'pages', 'p']):
+                    return True
+        
+        # Special check for single-word segments that are common non-content pages
+        # Only exclude if they're the ONLY segment or the FIRST segment
+        single_word_excludes = ['about', 'contact', 'page', 'pages']
+        if len(path_segments) > 0:
+            first_segment = path_segments[0]
+            # Exclude if it's a standalone page (e.g., /about, /contact)
+            if len(path_segments) == 1 and first_segment in single_word_excludes:
+                return True
+            # Also exclude if it's the first segment followed by another non-content segment
+            # (e.g., /about/team, /contact/form)
+            if (len(path_segments) == 2 and 
+                first_segment in single_word_excludes and
+                path_segments[1] in exclude_segments):
+                return True
+        
+        # Check for query parameters that suggest non-article pages
+        if parsed.query:
+            query_lower = parsed.query.lower()
+            exclude_params = ['search', 's=', 'q=', 'filter', 'sort']
+            for param in exclude_params:
+                if param in query_lower:
+                    return True
+        
+        return False
+    
+    def _get_browser_config(self, use_builtin_browser: bool = True) -> BrowserConfig:
+        """
+        Get browser configuration with enhanced error handling settings.
+        
+        Args:
+            use_builtin_browser: Whether to use builtin browser mode
+            
+        Returns:
+            BrowserConfig with optimized settings for avoiding ERR_ABORTED and bot detection
+        """
+        return BrowserConfig(
+            browser_mode="builtin" if use_builtin_browser else "default",
+            headless=True,
+            verbose=False,
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            extra_args=[
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-blink-features=AutomationControlled",
+                "--ignore-certificate-errors",
+                "--disable-extensions",
+                "--disable-popup-blocking"
+            ],
+        )
+    
     async def crawl(
         self,
         max_pages: int = 100,
         progress_callback: Optional[Callable] = None,
         mode: CrawlMode = CrawlMode.SIMPLE,
         max_depth: int = 5,
+        max_pagination_pages: int = 20,
         keywords: Optional[List[str]] = None,
         enable_virtual_scroll: bool = False,
         virtual_scroll_selector: str = None,
@@ -141,6 +312,7 @@ class EnhancedWebCrawler:
             progress_callback: Optional callback for progress updates (msg, current, total)
             mode: Crawl mode (SIMPLE, DEEP_BFS, DEEP_DFS, BEST_FIRST)
             max_depth: Maximum depth for deep crawl modes
+            max_pagination_pages: Maximum number of pagination pages to crawl (for PAGINATION mode)
             keywords: Keywords for relevance scoring (Best-First mode)
             enable_virtual_scroll: Enable virtual scrolling for infinite scroll pages
             virtual_scroll_selector: CSS selector for scroll container
@@ -168,7 +340,7 @@ class EnhancedWebCrawler:
         elif mode == CrawlMode.SITEMAP:
             result = await self._sitemap_crawl(max_pages, update, enable_virtual_scroll, virtual_scroll_selector, use_builtin_browser)
         elif mode == CrawlMode.PAGINATION:
-            result = await self._pagination_crawl(max_pages, update, enable_virtual_scroll, virtual_scroll_selector, use_builtin_browser)
+            result = await self._pagination_crawl(max_pages, max_pagination_pages, update, enable_virtual_scroll, virtual_scroll_selector, use_builtin_browser)
         elif mode == CrawlMode.CATEGORY:
             result = await self._category_crawl(max_pages, max_depth, update, enable_virtual_scroll, virtual_scroll_selector, use_builtin_browser)
         elif mode in [CrawlMode.DEEP_BFS, CrawlMode.DEEP_DFS, CrawlMode.BEST_FIRST]:
@@ -206,13 +378,8 @@ class EnhancedWebCrawler:
         discovered_urls = []
         structured_data = []  # For multi-format export
         
-        # Configure browser
-        browser_config = BrowserConfig(
-            browser_mode="builtin" if use_builtin_browser else "default",
-            headless=True,
-            verbose=False,
-            extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"],
-        )
+        # Configure browser using helper method
+        browser_config = self._get_browser_config(use_builtin_browser)
         
         # Configure virtual scroll if enabled
         virtual_scroll_config = None
@@ -224,7 +391,7 @@ class EnhancedWebCrawler:
                 wait_after_scroll=0.3
             )
         
-        # Configure crawler
+        # Configure crawler with timeout settings
         crawl_config = CrawlerRunConfig(
             check_robots_txt=True,
             cache_mode=CacheMode.BYPASS,
@@ -233,107 +400,110 @@ class EnhancedWebCrawler:
             scraping_strategy=LXMLWebScrapingStrategy(),
             only_text=True,
             remove_forms=True,
-            wait_until="domcontentloaded",
+            wait_until="networkidle",  # Wait for network to be idle instead of just DOM
             simulate_user=True,
             scan_full_page=True,
             verbose=False,
             screenshot=False,
-            virtual_scroll_config=virtual_scroll_config
+            virtual_scroll_config=virtual_scroll_config,
+            page_timeout=90000,  # 90 second timeout (increased from 60)
+            delay_before_return_html=2.0  # Increased delay for stability (was 0.5)
         )
         
-        crawler = AsyncWebCrawler(config=browser_config)
-        
-        try:
-            # Start crawler (needed for non-builtin mode)
-            if not use_builtin_browser:
-                await crawler.start()
-            
-            # Step 1: Crawl starting URL
-            update(f"Crawling starting URL: {self.start_url}")
-            
+        # Use context manager for proper resource cleanup
+        async with AsyncWebCrawler(config=browser_config) as crawler:
             try:
-                result = await crawler.arun(url=self.start_url, config=crawl_config)
-                
-                if result.success:
-                    filename = self._url_to_filename(self.start_url)
-                    filepath = self.output_dir / filename
-                    markdown_content = self._add_metadata(result.markdown.raw_markdown, self.start_url, result.status_code)
-                    filepath.write_text(markdown_content, encoding='utf-8')
-                    update(f"✓ Saved: {filename}", 1, max_pages)
-                    self._log(event="saved", mode="simple", url=self.start_url, status=str(result.status_code))
-                    results["success"] += 1
-                    self.visited_urls.add(self.start_url)
-                    
-                    # Collect structured data
-                    structured_data.append(self._extract_result_data(self.start_url, result))
-                    
-                    # Discover links
-                    if result.html:
-                        from bs4 import BeautifulSoup
-                        soup = BeautifulSoup(result.html, 'html.parser')
-                        for link in soup.find_all('a', href=True):
-                            href = link['href']
-                            full_url = urljoin(self.start_url, href)
-                            if urlparse(full_url).netloc == self.base_domain:
-                                if not full_url.startswith(('javascript:', 'mailto:', '#')):
-                                    full_url = full_url.split('#')[0]
-                                    if full_url not in discovered_urls and full_url not in self.visited_urls:
-                                        discovered_urls.append(full_url)
-                        
-                        update(f"Discovered {len(discovered_urls)} links to crawl")
-                else:
-                    results["failed"].append({"url": self.start_url, "error": result.error_message or "Unknown error"})
-                    self._log(event="failed", mode="simple", url=self.start_url, status=str(result.status_code), info=result.error_message or "Unknown error")
-            
-            except Exception as e:
-                results["failed"].append({"url": self.start_url, "error": str(e)})
-            
-            # Step 2: Crawl discovered links
-            total_to_crawl = min(len(discovered_urls), max_pages - 1)
-            for i, url in enumerate(discovered_urls[:max_pages - 1]):
-                if self.cancelled:
-                    break
-                
-                if url in self.visited_urls:
-                    continue
-                
-                # Yield control more frequently to prevent UI hanging
-                await asyncio.sleep(0)
+                # Step 1: Crawl starting URL
+                update(f"Crawling starting URL: {self.start_url}")
                 
                 try:
-                    current_index = results["success"] + 1
-                    update(f"Crawling page {current_index}/{max_pages}: {url}", current_index, max_pages)
-                    
-                    result = await crawler.arun(url=url, config=crawl_config)
+                    result = await crawler.arun(url=self.start_url, config=crawl_config)
                     
                     if result.success:
-                        filename = self._url_to_filename(url)
+                        filename = self._url_to_filename(self.start_url)
                         filepath = self.output_dir / filename
-                        markdown_content = self._add_metadata(result.markdown.raw_markdown, url, result.status_code)
+                        markdown_content = self._add_metadata(result.markdown.raw_markdown, self.start_url, result.status_code)
                         filepath.write_text(markdown_content, encoding='utf-8')
-                        update(f"✓ Saved: {filename}", current_index, max_pages)
-                        self._log(event="saved", mode="simple", url=url, status=str(result.status_code))
+                        update(f"✓ Saved: {filename}", 1, max_pages)
+                        self._log(event="saved", mode="simple", url=self.start_url, status=str(result.status_code))
                         results["success"] += 1
-                        self.visited_urls.add(url)
+                        self.visited_urls.add(self.start_url)
                         
                         # Collect structured data
-                        structured_data.append(self._extract_result_data(url, result))
+                        structured_data.append(self._extract_result_data(self.start_url, result))
+                        
+                        # Discover links
+                        if result.html:
+                            from bs4 import BeautifulSoup
+                            soup = BeautifulSoup(result.html, 'html.parser')
+                            for link in soup.find_all('a', href=True):
+                                href = link['href']
+                                full_url = urljoin(self.start_url, href)
+                                if urlparse(full_url).netloc == self.base_domain:
+                                    if not full_url.startswith(('javascript:', 'mailto:', '#')):
+                                        full_url = full_url.split('#')[0]
+                                        # Apply URL filtering
+                                        if (full_url not in discovered_urls and 
+                                            full_url not in self.visited_urls and
+                                            not self._should_exclude_url(full_url)):
+                                            discovered_urls.append(full_url)
+                            
+                            update(f"Discovered {len(discovered_urls)} links to crawl")
                     else:
-                        results["failed"].append({"url": url, "error": result.error_message or "Unknown error"})
-                        self._log(event="failed", mode="simple", url=url, status=str(result.status_code), info=result.error_message or "Unknown error")
-                        # Still collect data for failed pages
-                        structured_data.append(self._extract_result_data(url, result))
+                        results["failed"].append({"url": self.start_url, "error": result.error_message or "Unknown error"})
+                        self._log(event="failed", mode="simple", url=self.start_url, status=str(result.status_code), info=result.error_message or "Unknown error")
                 
                 except Exception as e:
-                    results["failed"].append({"url": url, "error": str(e)})
-                    self._log(event="error", mode="simple", url=url, info=str(e))
+                    results["failed"].append({"url": self.start_url, "error": str(e)})
+                    self._log(event="error", mode="simple", url=self.start_url, info=str(e))
                 
-                # Yield control to allow UI updates
-                await asyncio.sleep(0.1)
-        
-        finally:
-            if not use_builtin_browser:
-                await crawler.close()
+                # Step 2: Crawl discovered links
+                total_to_crawl = min(len(discovered_urls), max_pages - 1)
+                for i, url in enumerate(discovered_urls[:max_pages - 1]):
+                    if self.cancelled:
+                        break
+                    
+                    if url in self.visited_urls:
+                        continue
+                    
+                    # Yield control more frequently to prevent UI hanging
+                    await asyncio.sleep(0)
+                    
+                    try:
+                        current_index = results["success"] + 1
+                        update(f"Crawling page {current_index}/{max_pages}: {url}", current_index, max_pages)
+                        
+                        result = await crawler.arun(url=url, config=crawl_config)
+                        
+                        if result.success:
+                            filename = self._url_to_filename(url)
+                            filepath = self.output_dir / filename
+                            markdown_content = self._add_metadata(result.markdown.raw_markdown, url, result.status_code)
+                            filepath.write_text(markdown_content, encoding='utf-8')
+                            update(f"✓ Saved: {filename}", current_index, max_pages)
+                            self._log(event="saved", mode="simple", url=url, status=str(result.status_code))
+                            results["success"] += 1
+                            self.visited_urls.add(url)
+                            
+                            # Collect structured data
+                            structured_data.append(self._extract_result_data(url, result))
+                        else:
+                            results["failed"].append({"url": url, "error": result.error_message or "Unknown error"})
+                            self._log(event="failed", mode="simple", url=url, status=str(result.status_code), info=result.error_message or "Unknown error")
+                            # Still collect data for failed pages
+                            structured_data.append(self._extract_result_data(url, result))
+                    
+                    except Exception as e:
+                        results["failed"].append({"url": url, "error": str(e)})
+                        self._log(event="error", mode="simple", url=url, info=str(e))
+                    
+                    # Yield control to allow UI updates
+                    await asyncio.sleep(0.1)
+            
+            except Exception as e:
+                # Catch any unexpected errors in the entire crawl process
+                self._log(event="critical_error", mode="simple", info=str(e))
+                results["failed"].append({"url": "crawl_process", "error": str(e)})
         
         return CrawlResult(
             success=results["success"] > 0,
@@ -360,19 +530,8 @@ class EnhancedWebCrawler:
         """
         update(f"Starting {mode.value} deep crawl (depth={max_depth}, max_pages={max_pages})")
         
-        # Configure browser with more robust settings
-        browser_config = BrowserConfig(
-            browser_mode="builtin" if use_builtin_browser else "default",
-            headless=True,
-            verbose=False,
-            extra_args=[
-                "--disable-gpu", 
-                "--disable-dev-shm-usage", 
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-web-security"
-            ],
-        )
+        # Configure browser using helper method
+        browser_config = self._get_browser_config(use_builtin_browser)
         
         # Configure filters
         filter_chain = FilterChain([
@@ -430,8 +589,8 @@ class EnhancedWebCrawler:
             verbose=False,
             stream=True,  # Stream results as they come
             virtual_scroll_config=virtual_scroll_config,
-            page_timeout=60000,  # 60 second timeout
-            wait_until="domcontentloaded",  # Don't wait for all resources
+            page_timeout=90000,  # 90 second timeout (increased from 60)
+            wait_until="networkidle",  # Wait for network to be idle instead of just DOM
             simulate_user=True,
             magic=True  # Enable anti-detection features
         )
@@ -440,94 +599,94 @@ class EnhancedWebCrawler:
         failed = []
         structured_data = []  # For multi-format export
         
-        crawler = AsyncWebCrawler(config=browser_config)
-        
-        try:
-            # Start crawler (needed for non-builtin mode)
-            if not use_builtin_browser:
-                await crawler.start()
-            
-            # Execute deep crawl with streaming and robust error handling
-            current = 0
-            consecutive_failures = 0
-            max_consecutive_failures = 5
-            
+        # Use async context manager for proper resource cleanup
+        async with AsyncWebCrawler(config=browser_config) as crawler:
             try:
-                async for result in await crawler.arun(url=self.start_url, config=crawl_config):
-                    # Yield control to prevent UI blocking
-                    await asyncio.sleep(0)
-                    
-                    if self.cancelled:
-                        update("Crawl cancelled by user", current, max_pages)
-                        break
-                    
-                    current += 1
-                    depth = result.metadata.get("depth", 0) if result.metadata else 0
-                    score = result.metadata.get("score", 0) if result.metadata else 0
-                    
-                    try:
-                        if result.success:
-                            filename = self._url_to_filename(result.url)
-                            filepath = self.output_dir / filename
-                            markdown_content = self._add_metadata(result.markdown.raw_markdown, result.url, result.status_code)
-                            filepath.write_text(markdown_content, encoding='utf-8')
-                            
-                            if mode == CrawlMode.BEST_FIRST and score > 0:
-                                update(f"✓ Saved (depth={depth}, score={score:.2f}): {filename}", current, max_pages)
+                # Execute deep crawl with streaming and robust error handling
+                current = 0
+                consecutive_failures = 0
+                max_consecutive_failures = 5
+                
+                try:
+                    async for result in await crawler.arun(url=self.start_url, config=crawl_config):
+                        # Yield control to prevent UI blocking
+                        await asyncio.sleep(0)
+                        
+                        if self.cancelled:
+                            update("Crawl cancelled by user", current, max_pages)
+                            break
+                        
+                        current += 1
+                        depth = result.metadata.get("depth", 0) if result.metadata else 0
+                        score = result.metadata.get("score", 0) if result.metadata else 0
+                        
+                        try:
+                            if result.success:
+                                filename = self._url_to_filename(result.url)
+                                filepath = self.output_dir / filename
+                                markdown_content = self._add_metadata(result.markdown.raw_markdown, result.url, result.status_code)
+                                filepath.write_text(markdown_content, encoding='utf-8')
+                                
+                                if mode == CrawlMode.BEST_FIRST and score > 0:
+                                    update(f"✓ Saved (depth={depth}, score={score:.2f}): {filename}", current, max_pages)
+                                else:
+                                    update(f"✓ Saved (depth={depth}): {filename}", current, max_pages)
+                                
+                                results_list.append(result)
+                                consecutive_failures = 0  # Reset failure counter on success
+                                
+                                # Collect structured data
+                                structured_data.append(self._extract_result_data(result.url, result))
+                                self._log(event="saved", mode=mode.value, url=result.url, status=str(result.status_code))
                             else:
-                                update(f"✓ Saved (depth={depth}): {filename}", current, max_pages)
-                            
-                            results_list.append(result)
-                            consecutive_failures = 0  # Reset failure counter on success
-                            
-                            # Collect structured data
-                            structured_data.append(self._extract_result_data(result.url, result))
-                            self._log(event="saved", mode=mode.value, url=result.url, status=str(result.status_code))
-                        else:
-                            error_msg = result.error_message or "Unknown error"
-                            failed.append({"url": result.url, "error": error_msg})
-                            update(f"✗ Failed (depth={depth}): {result.url} - {error_msg}", current, max_pages)
+                                error_msg = result.error_message or "Unknown error"
+                                failed.append({"url": result.url, "error": error_msg})
+                                update(f"✗ Failed (depth={depth}): {result.url} - {error_msg}", current, max_pages)
+                                consecutive_failures += 1
+                                self._log(event="failed", mode=mode.value, url=result.url, status=str(result.status_code), info=error_msg)
+                                
+                                # Still collect data for failed pages
+                                structured_data.append(self._extract_result_data(result.url, result))
+                                
+                                # If too many consecutive failures, stop
+                                if consecutive_failures >= max_consecutive_failures:
+                                    update(f"⚠️ Stopping: {max_consecutive_failures} consecutive failures", current, max_pages)
+                                    break
+                        
+                        except Exception as e:
+                            error_msg = f"Error processing result: {str(e)}"
+                            failed.append({"url": result.url if hasattr(result, 'url') else 'unknown', "error": error_msg})
+                            update(f"✗ Processing error: {error_msg}", current, max_pages)
                             consecutive_failures += 1
-                            self._log(event="failed", mode=mode.value, url=result.url, status=str(result.status_code), info=error_msg)
+                            self._log(event="error", mode=mode.value, url=result.url if hasattr(result, 'url') else 'unknown', info=error_msg)
                             
-                            # Still collect data for failed pages
-                            structured_data.append(self._extract_result_data(result.url, result))
-                            
-                            # If too many consecutive failures, stop
                             if consecutive_failures >= max_consecutive_failures:
                                 update(f"⚠️ Stopping: {max_consecutive_failures} consecutive failures", current, max_pages)
                                 break
-                    
-                    except Exception as e:
-                        error_msg = f"Error processing result: {str(e)}"
-                        failed.append({"url": result.url if hasattr(result, 'url') else 'unknown', "error": error_msg})
-                        update(f"✗ Processing error: {error_msg}", current, max_pages)
-                        consecutive_failures += 1
-                        self._log(event="error", mode=mode.value, url=result.url if hasattr(result, 'url') else 'unknown', info=error_msg)
                         
-                        if consecutive_failures >= max_consecutive_failures:
-                            update(f"⚠️ Stopping: {max_consecutive_failures} consecutive failures", current, max_pages)
-                            break
-                    
-                    # Add small delay to avoid overwhelming the server
-                    await asyncio.sleep(0.5)
-            
-            except RuntimeError as e:
-                # Handle navigation errors gracefully
-                error_msg = str(e)
-                if "Failed on navigating" in error_msg or "ACS-GOTO" in error_msg:
-                    update(f"⚠️ Navigation error: {error_msg}", current, max_pages)
-                    update("Tip: This may be due to network issues, rate limiting, or site protection", current, max_pages)
-                else:
-                    raise  # Re-raise if it's a different RuntimeError
+                        # Add small delay to avoid overwhelming the server
+                        await asyncio.sleep(0.5)
+                
+                except RuntimeError as e:
+                    # Handle navigation errors gracefully
+                    error_msg = str(e)
+                    if "Failed on navigating" in error_msg or "ACS-GOTO" in error_msg or "Connection closed" in error_msg:
+                        update(f"⚠️ Navigation/Connection error: {error_msg[:100]}", current, max_pages)
+                        update("Tip: This may be due to network issues, rate limiting, or site protection", current, max_pages)
+                    else:
+                        raise  # Re-raise if it's a different RuntimeError
+                
+                except Exception as e:
+                    # Catch any other errors during crawling
+                    error_msg = str(e)
+                    if "Connection closed" in error_msg:
+                        update(f"⚠️ Browser connection lost: {error_msg[:100]}", current, max_pages)
+                    else:
+                        update(f"⚠️ Crawl error: {error_msg}", current, max_pages)
             
             except Exception as e:
-                # Catch any other errors during crawling
-                update(f"⚠️ Crawl error: {str(e)}", current, max_pages)
-        
-        finally:
-            if not use_builtin_browser:
-                await crawler.close()
+                # Catch top-level errors
+                self._log(event="critical_error", mode=mode.value, info=str(e))
         
         return CrawlResult(
             success=len(results_list) > 0,
@@ -677,8 +836,8 @@ Crawled: {datetime.now().isoformat()}
                 verbose=False,
                 stream=True,
                 virtual_scroll_config=virtual_scroll_config,
-                page_timeout=60000,
-                wait_until="domcontentloaded",
+                page_timeout=90000,  # 90 second timeout (increased from 60)
+                wait_until="networkidle",  # Wait for network to be idle instead of just DOM
                 simulate_user=True,
                 magic=True
             )
@@ -838,6 +997,7 @@ Crawled: {datetime.now().isoformat()}
     async def _pagination_crawl(
         self,
         max_pages: int,
+        max_pagination_pages: int,
         update: Callable,
         enable_virtual_scroll: bool,
         virtual_scroll_selector: str,
@@ -847,6 +1007,14 @@ Crawled: {datetime.now().isoformat()}
         Two-phase pagination crawl
         Phase 1: Extract article URLs from pagination pages
         Phase 2: Crawl discovered articles
+        
+        Args:
+            max_pages: Maximum number of article pages to crawl
+            max_pagination_pages: Maximum number of pagination pages to check
+            update: Progress callback function
+            enable_virtual_scroll: Enable virtual scrolling
+            virtual_scroll_selector: CSS selector for virtual scroll
+            use_builtin_browser: Use builtin browser mode
         """
         update("Starting pagination-based crawl...")
         
@@ -856,7 +1024,7 @@ Crawled: {datetime.now().isoformat()}
             
             update(f"  Detected {pagination_type}-based pagination: {pagination_pattern}")
             update(f"  Base URL: {base_list_url}")
-            update(f"  Phase 1: Extracting article URLs from up to fi20 pagination pages")
+            update(f"  Phase 1: Extracting article URLs from up to {max_pagination_pages} pagination pages")
             
             # Phase 1: Extract article URLs
             all_article_urls = set()
@@ -872,7 +1040,11 @@ Crawled: {datetime.now().isoformat()}
             crawl_config = CrawlerRunConfig(
                 scraping_strategy=LXMLWebScrapingStrategy(),
                 cache_mode=CacheMode.BYPASS,
-                verbose=False
+                verbose=False,
+                page_timeout=60000,  # 60 second timeout
+                wait_until="domcontentloaded",  # Wait for DOM content to be loaded
+                simulate_user=True,
+                delay_before_return_html=0.5
             )
             
             crawler = AsyncWebCrawler(config=browser_config)
@@ -881,8 +1053,8 @@ Crawled: {datetime.now().isoformat()}
                 if not use_builtin_browser:
                     await crawler.start()
                 
-                # Crawl pagination pages (up to 20)
-                for page_num in range(1, 21):
+                # Crawl pagination pages (up to max_pagination_pages)
+                for page_num in range(1, max_pagination_pages + 1):
                     # Generate pagination URL based on detected pattern
                     if pagination_type == 'query':
                         page_url = f"{base_list_url}{pagination_pattern}{page_num}"
@@ -931,7 +1103,7 @@ Crawled: {datetime.now().isoformat()}
                             # Only include URLs from same domain that look like articles
                             if (full_url.startswith(self.base_url) and
                                 not is_pagination_url and
-                                not any(x in full_url.lower() for x in ['/about', '/contact', '/privacy', '/category', '/tag'])):
+                                not self._should_exclude_url(full_url)):
                                 all_article_urls.add(full_url)
                     
                     await asyncio.sleep(1)  # Rate limiting
@@ -1025,22 +1197,16 @@ Crawled: {datetime.now().isoformat()}
             
             update(f"  Total found: {len(all_urls)} URLs from all sitemap(s)")
             
-            # Reverse URL order for post-sitemaps (start from bottom/newest)
-            if is_post_sitemap_crawl:
-                all_urls.reverse()
-                update(f"  ⏪ Reversed URL order - starting from newest posts (bottom of sitemap)")
+            # For numbered sitemaps, URLs are already in correct order
+            # (highest numbered sitemap processed first = newest posts first)
+            if is_post_sitemap_crawl and numbered_sitemaps:
+                update(f"  ✓ URLs ordered by sitemap number (highest/newest first)")
             
-            # Filter unwanted URLs
-            exclude_patterns = ["*/about*", "*/contact*", "*.pdf", "*.jpg", "*.png", "*.jpeg", "*.gif"]
+            # Filter unwanted URLs using centralized filtering
             filtered_urls = []
             for url in all_urls:
                 url_str = url if isinstance(url, str) else url.get("url", "")
-                exclude = False
-                for pattern in exclude_patterns:
-                    if re.match(pattern.replace('*', '.*'), url_str):
-                        exclude = True
-                        break
-                if not exclude:
+                if not self._should_exclude_url(url_str):
                     filtered_urls.append(url_str)
             
             update(f"  After filtering: {len(filtered_urls)} URLs to crawl")
@@ -1084,7 +1250,7 @@ Crawled: {datetime.now().isoformat()}
         """
         Discover sitemaps with prioritization:
         1. Numbered content sitemaps (news, article, post) - highest first
-        2. Non-numbered content sitemaps
+        2. Non-numbered content sitemaps (only if no numbered ones found)
         3. Standard sitemap.xml and sitemap_index.xml
         """
         sitemap_urls = []
@@ -1099,27 +1265,28 @@ Crawled: {datetime.now().isoformat()}
                 sitemap_urls.extend(numbered_sitemaps)
                 update(f"  ✓ Found {len(numbered_sitemaps)} numbered {keyword}-sitemap(s)")
         
-        # Check for non-numbered content sitemaps
-        update("  Checking for non-numbered content sitemaps...")
-        headers = {"User-Agent": "Mozilla/5.0"}
-        
-        for keyword in content_keywords:
-            try:
-                non_numbered_url = f"{self.base_url}/{keyword}-sitemap.xml"
-                response = requests.get(non_numbered_url, headers=headers, timeout=10)
-                
-                if response.status_code == 200:
-                    try:
-                        content = response.content
-                        if non_numbered_url.endswith('.gz'):
-                            content = gzip.decompress(content)
-                        ET.fromstring(content)
-                        sitemap_urls.append(non_numbered_url)
-                        update(f"  ✓ Found non-numbered {keyword}-sitemap.xml")
-                    except ET.ParseError:
-                        pass
-            except Exception:
-                pass
+        # Check for non-numbered content sitemaps ONLY if no numbered ones found
+        if not sitemap_urls:
+            update("  Checking for non-numbered content sitemaps...")
+            headers = {"User-Agent": "Mozilla/5.0"}
+            
+            for keyword in content_keywords:
+                try:
+                    non_numbered_url = f"{self.base_url}/{keyword}-sitemap.xml"
+                    response = requests.get(non_numbered_url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        try:
+                            content = response.content
+                            if non_numbered_url.endswith('.gz'):
+                                content = gzip.decompress(content)
+                            ET.fromstring(content)
+                            sitemap_urls.append(non_numbered_url)
+                            update(f"  ✓ Found non-numbered {keyword}-sitemap.xml")
+                        except ET.ParseError:
+                            pass
+                except Exception:
+                    pass
         
         # If no content sitemaps found, check standard sitemaps
         if not sitemap_urls:
@@ -1262,12 +1429,14 @@ Crawled: {datetime.now().isoformat()}
             scraping_strategy=LXMLWebScrapingStrategy(),
             only_text=True,
             remove_forms=True,
-            wait_until="domcontentloaded",
+            wait_until="networkidle",  # Wait for network to be idle instead of just DOM
             simulate_user=True,
             scan_full_page=True,
             verbose=False,
             screenshot=False,
-            virtual_scroll_config=virtual_scroll_config
+            virtual_scroll_config=virtual_scroll_config,
+            page_timeout=90000,  # 90 second timeout
+            delay_before_return_html=2.0  # Increased delay for stability
         )
         
         crawler = AsyncWebCrawler(config=browser_config)
@@ -1407,6 +1576,18 @@ Crawled: {datetime.now().isoformat()}
             writer.writerows(structured_data)
         
         print(f"✓ CSV saved: {filepath}")
+        
+        # Upload to S3 if available
+        if HAS_S3_STORAGE:
+            try:
+                storage = get_storage()
+                # Extract domain from start_url for S3 key
+                domain = urlparse(self.start_url).netloc.replace('www.', '').replace('.', '_')
+                s3_key = f"crawled_data/{domain}_{timestamp}.csv"
+                storage.upload_file(str(filepath), s3_key)
+                print(f"✓ CSV uploaded to S3: {s3_key}")
+            except Exception as e:
+                print(f"⚠️ Failed to upload CSV to S3: {e}")
     
     def _save_json(self, structured_data: List[Dict], output_dir: Path, timestamp: str, include_content: bool = True):
         """Save structured data to JSON file."""
@@ -1444,6 +1625,18 @@ Crawled: {datetime.now().isoformat()}
             json.dump(json_data, f, indent=2, ensure_ascii=False)
         
         print(f"✓ JSON saved: {filepath}")
+        
+        # Upload to S3 if available
+        if HAS_S3_STORAGE:
+            try:
+                storage = get_storage()
+                # Extract domain from start_url for S3 key
+                domain = urlparse(self.start_url).netloc.replace('www.', '').replace('.', '_')
+                s3_key = f"crawled_data/{domain}_{timestamp}.json"
+                storage.upload_file(str(filepath), s3_key)
+                print(f"✓ JSON uploaded to S3: {s3_key}")
+            except Exception as e:
+                print(f"⚠️ Failed to upload JSON to S3: {e}")
     
     def generate_crawl_summary(self, structured_data: List[Dict]):
         """Generate and print a summary of the crawling session."""

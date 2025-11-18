@@ -70,7 +70,8 @@ class CrawlStrategyDetector:
                     r'/p/\d+',         # /p/2, /p/3
                     r'/p\d+',          # /p2, /p3 (Quaise.com style)
                     r'&page=\d+',      # &page=2, &page=3
-                    r'/\d+/$'          # /2/, /3/
+                    r'/\d+/$',          # /2/, /3/
+                    r'\?_page=\d+',     # ?_page=2, ?_page=3
                 ]
                 
                 pagination_found = False

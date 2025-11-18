@@ -2,6 +2,7 @@
 Summarization Agent
 
 This agent summarizes text content from CSV files using a tech-intelligence focused prompt.
+Includes S3 storage integration for data persistence.
 """
 
 from config.azure_model import model
@@ -11,6 +12,13 @@ import logging
 from pathlib import Path
 from datetime import datetime
 import time
+
+# Import S3 storage
+try:
+    from aws_storage import get_storage
+    HAS_S3_STORAGE = True
+except ImportError:
+    HAS_S3_STORAGE = False
 
 # Tech Intelligence Summarization Prompt
 TECH_INTEL_PROMPT = """
@@ -22,7 +30,7 @@ Extract the following fields from the article:
 - Indicator: A concise 1-paragraph summary (3-5 sentences) strictly focusing on the key technological development, event, or trend described in the article. If there are any companies
 mentioned in the article, make sure they are captured. Avoid generic openers like "The article hightlights..." or "The article discusses...". 
 
-- ee (choose one, using the abbreviation):
+- Dimension: Primary category based on the article content (choose only one of them, using the abbreviation):
     - Tech (Technology)
     - Pol (Policy)
     - Econ (Economic)
@@ -195,7 +203,6 @@ async def summarize_csv_file(
     df['Indicator'] = None
     df['Dimension'] = None
     df['Tech'] = None
-    df['TRL'] = None
     df['Start-up'] = None
     
     # Track processing stats
@@ -216,7 +223,6 @@ async def summarize_csv_file(
                 df.at[idx, 'Indicator'] = "[Empty content - no summary generated]"
                 df.at[idx, 'Dimension'] = ''
                 df.at[idx, 'Tech'] = ''
-                df.at[idx, 'TRL'] = ''
                 df.at[idx, 'Start-up'] = ''
                 failed += 1
                 logging.warning(f"Row {idx + 1}/{total_rows} has no content to process")
@@ -229,7 +235,6 @@ async def summarize_csv_file(
             df.at[idx, 'Indicator'] = structured_data.get('indicator', '')
             df.at[idx, 'Dimension'] = structured_data.get('dimension', '')
             df.at[idx, 'Tech'] = structured_data.get('tech', '')
-            df.at[idx, 'TRL'] = structured_data.get('trl', '')
             df.at[idx, 'Start-up'] = structured_data.get('start_up', '')
             
             successful += 1
@@ -241,7 +246,6 @@ async def summarize_csv_file(
             df.at[idx, 'Indicator'] = f"[Error: {str(e)}]"
             df.at[idx, 'Dimension'] = ''
             df.at[idx, 'Tech'] = ''
-            df.at[idx, 'TRL'] = ''
             df.at[idx, 'Start-up'] = ''
             failed += 1
         
@@ -319,6 +323,31 @@ def save_summarized_csv(
     
     # Format date columns to ISO date format (YYYY-MM-DD) without time
     df_copy = df.copy()
+    
+    # Define the required output columns in the correct order
+    required_columns = [
+        'filename', 'filepath', 'url', 'title', 'publication_date', 
+        'content', 'categories', 'Indicator', 'Dimension', 'Tech', 'Start-up'
+    ]
+    
+    # Select only the required columns that exist in the dataframe
+    # Handle both old format (file) and new format (filename/filepath)
+    available_columns = []
+    for col in required_columns:
+        if col in df_copy.columns:
+            available_columns.append(col)
+        elif col == 'filename' and 'file' in df_copy.columns:
+            # For backward compatibility, map 'file' to 'filename'
+            df_copy['filename'] = df_copy['file']
+            available_columns.append('filename')
+        elif col == 'filepath' and 'file' in df_copy.columns:
+            # If only 'file' exists and no 'filepath', use empty string
+            df_copy['filepath'] = ''
+            available_columns.append('filepath')
+    
+    # Reorder dataframe to match required column order
+    df_copy = df_copy[available_columns]
+    
     for col in df_copy.columns:
         if col.lower() in ['pubdate', 'date', 'published', 'publish_date']:
             try:
@@ -364,6 +393,26 @@ def save_summarized_csv(
     logging.info(f"Saved summarized CSV to: {csv_path}")
     logging.info(f"Saved summarized JSON to: {json_path}")
     logging.info(f"Saved log to: {log_path}")
+    
+    # Upload to S3 if available (only CSV and JSON, not log or history files)
+    if HAS_S3_STORAGE:
+        try:
+            storage = get_storage()
+            
+            # Upload CSV to S3
+            s3_csv_key = f"summarised_content/{csv_filename}"
+            storage.upload_file(str(csv_path), s3_csv_key)
+            logging.info(f"✓ CSV uploaded to S3: {s3_csv_key}")
+            
+            # Upload JSON to S3
+            s3_json_key = f"summarised_content/{json_filename}"
+            storage.upload_file(str(json_path), s3_json_key)
+            logging.info(f"✓ JSON uploaded to S3: {s3_json_key}")
+            
+            # Note: Log files and history.json are kept local only
+            
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to upload to S3: {e}")
     
     return csv_path, json_path, log_path
 
