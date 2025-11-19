@@ -18,3 +18,4 @@ selenium>=4.0.0
 boto3>=1.26.0
 botocore>=1.34.0
 streamlit-agraph>=0.0.43
+llama-index-embeddings-azure-openai
