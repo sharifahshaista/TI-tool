@@ -28,7 +28,7 @@ and extract specific information fields in a standardised format.
 Extract the following fields from the article:
 
 - Indicator: A concise 1-paragraph summary (3-5 sentences) strictly focusing on the key technological development, event, or trend described in the article. If there are any companies
-mentioned in the article, make sure they are captured. Avoid generic openers like "The article hightlights..." or "The article discusses...". 
+mentioned in the article, make sure they are captured. Avoid generic openers like "The article hightlights..." or "The article discusses...". Only use English characters and standard numerals.
 
 - Dimension: Primary category based on the article content (choose only one of them, using the abbreviation):
     - Tech (Technology)
@@ -203,6 +203,7 @@ async def summarize_csv_file(
     df['Indicator'] = None
     df['Dimension'] = None
     df['Tech'] = None
+    df['TRL'] = None
     df['Start-up'] = None
     
     # Track processing stats
@@ -211,7 +212,7 @@ async def summarize_csv_file(
     failed = 0
     
     # Process each row
-    for idx, row in df.iterrows():
+    for row_num, (idx, row) in enumerate(df.iterrows()):
         row_start_time = time.time()
         
         try:
@@ -220,37 +221,38 @@ async def summarize_csv_file(
             # Check if content is still empty after filling
             if not content or content.strip() == '' or content.lower() == 'nan':
                 # Mark as empty - content snippet should have been filled earlier
-                df.at[idx, 'Indicator'] = "[Empty content - no summary generated]"
-                df.at[idx, 'Dimension'] = ''
-                df.at[idx, 'Tech'] = ''
-                df.at[idx, 'Start-up'] = ''
+                df.loc[idx, 'Indicator'] = "[Empty content - no summary generated]"  # type: ignore
+                df.loc[idx, 'Dimension'] = ''  # type: ignore
+                df.loc[idx, 'Tech'] = ''  # type: ignore
+                df.loc[idx, 'Start-up'] = ''  # type: ignore
                 failed += 1
-                logging.warning(f"Row {idx + 1}/{total_rows} has no content to process")
+                logging.warning(f"Row {row_num + 1}/{total_rows} has no content to process")
                 continue
             
             # Summarize content and extract structured fields
             structured_data = await summarize_content(content, custom_model)
             
             # Populate the structured columns
-            df.at[idx, 'Indicator'] = structured_data.get('indicator', '')
-            df.at[idx, 'Dimension'] = structured_data.get('dimension', '')
-            df.at[idx, 'Tech'] = structured_data.get('tech', '')
-            df.at[idx, 'Start-up'] = structured_data.get('start_up', '')
+            df.loc[idx, 'Indicator'] = structured_data.get('indicator', '')  # type: ignore
+            df.loc[idx, 'Dimension'] = structured_data.get('dimension', '')  # type: ignore
+            df.loc[idx, 'Tech'] = structured_data.get('tech', '')  # type: ignore
+            df.loc[idx, 'TRL'] = structured_data.get('trl', '')  # type: ignore
+            df.loc[idx, 'Start-up'] = structured_data.get('start_up', '')  # type: ignore
             
             successful += 1
             
-            logging.info(f"Processed row {idx + 1}/{total_rows}")
+            logging.info(f"Processed row {row_num + 1}/{total_rows}")
             
         except Exception as e:
             logging.error(f"Error processing row {idx}: {e}")
-            df.at[idx, 'Indicator'] = f"[Error: {str(e)}]"
-            df.at[idx, 'Dimension'] = ''
-            df.at[idx, 'Tech'] = ''
-            df.at[idx, 'Start-up'] = ''
+            df.loc[idx, 'Indicator'] = f"[Error: {str(e)}]"  # type: ignore
+            df.loc[idx, 'Dimension'] = ''  # type: ignore
+            df.loc[idx, 'Tech'] = ''  # type: ignore
+            df.loc[idx, 'Start-up'] = ''  # type: ignore
             failed += 1
         
         # Calculate progress and time estimates
-        current_row = idx + 1
+        current_row = row_num + 1
         elapsed_time = time.time() - start_time
         rows_remaining = total_rows - current_row
         
@@ -327,7 +329,7 @@ def save_summarized_csv(
     # Define the required output columns in the correct order
     required_columns = [
         'filename', 'filepath', 'url', 'title', 'publication_date', 
-        'content', 'categories', 'Indicator', 'Dimension', 'Tech', 'Start-up'
+        'content', 'categories', 'Indicator', 'Dimension', 'Tech', 'TRL', 'Start-up'
     ]
     
     # Select only the required columns that exist in the dataframe
@@ -397,6 +399,7 @@ def save_summarized_csv(
     # Upload to S3 if available (only CSV and JSON, not log or history files)
     if HAS_S3_STORAGE:
         try:
+            from aws_storage import get_storage
             storage = get_storage()
             
             # Upload CSV to S3

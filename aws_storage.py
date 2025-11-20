@@ -55,12 +55,14 @@ class S3Storage:
         aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
         
         # If environment variables not found, try Streamlit secrets
-        if HAS_STREAMLIT and hasattr(st, 'secrets') and (not self.bucket_name or not aws_access_key or not aws_secret_key):
+        if HAS_STREAMLIT and (not self.bucket_name or not aws_access_key or not aws_secret_key):
             try:
-                self.bucket_name = self.bucket_name or st.secrets.get("AWS", {}).get("S3_BUCKET_NAME") or st.secrets.get("AWS_S3_BUCKET")
-                self.region = self.region or st.secrets.get("AWS", {}).get("AWS_DEFAULT_REGION") or st.secrets.get("AWS_REGION", "us-east-1")
-                aws_access_key = aws_access_key or st.secrets.get("AWS", {}).get("AWS_ACCESS_KEY_ID") or st.secrets.get("AWS_ACCESS_KEY_ID")
-                aws_secret_key = aws_secret_key or st.secrets.get("AWS", {}).get("AWS_SECRET_ACCESS_KEY") or st.secrets.get("AWS_SECRET_ACCESS_KEY")
+                import streamlit as st
+                if hasattr(st, 'secrets'):
+                    self.bucket_name = self.bucket_name or st.secrets.get("AWS", {}).get("S3_BUCKET_NAME") or st.secrets.get("AWS_S3_BUCKET")
+                    self.region = self.region or st.secrets.get("AWS", {}).get("AWS_DEFAULT_REGION") or st.secrets.get("AWS_REGION", "us-east-1")
+                    aws_access_key = aws_access_key or st.secrets.get("AWS", {}).get("AWS_ACCESS_KEY_ID") or st.secrets.get("AWS_ACCESS_KEY_ID")
+                    aws_secret_key = aws_secret_key or st.secrets.get("AWS", {}).get("AWS_SECRET_ACCESS_KEY") or st.secrets.get("AWS_SECRET_ACCESS_KEY")
             except:
                 pass  # Streamlit secrets not available, use what we have
         

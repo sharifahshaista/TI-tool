@@ -1,4 +1,4 @@
-"""
+""" # type: ignore
 Streamlit Research Agent Web Application
 
 This app provides a web interface for:
@@ -29,7 +29,7 @@ from agents.clarification import get_clarifications
 from agents.serp import get_serp_queries
 from agents.learn import get_learning_structured
 from agents.summarise_csv import summarize_csv_file, save_summarized_csv
-from config.searxng_tools import searxng_web_tool
+from config.searxng_tools import searxng_web_tool, searxng_client
 from config.model_config import get_model
 from schemas.datamodel import (
     SearchResultsCollection,
@@ -339,7 +339,7 @@ def run_search_stage(serp_queries):
             logging.info(f"Searching [{idx}/{total_queries}]: {query}")
 
             try:
-                results = await searxng_web_tool(None, query)
+                results = await searxng_client._search(query)
                 results_collection.add_result(query, results)
                 logging.info(f"Search successful: {query}")
             except Exception as e:
@@ -2041,6 +2041,12 @@ elif page == "Summarization":
                             model_config = st.session_state.get('selected_model_config', {'provider': 'azure', 'model_name': 'pmo-gpt-4.1-nano'})
                             selected_model = get_model(**model_config)
                             
+                            # Type guard to ensure selected_csv_path and content_col are not None
+                            if selected_csv_path is None:
+                                raise ValueError("No CSV file selected")
+                            if content_col is None:
+                                raise ValueError("No content column selected")
+                            
                             # Use the detected content column
                             df_result, duration, metadata = await summarize_csv_file(
                                 selected_csv_path, 
@@ -2374,6 +2380,24 @@ elif page == "Database":
     st.header("📊 Summarization Database")
     st.markdown("Consolidated view of all summarized CSV files with advanced search and filtering")
     
+    # Add instructions
+    with st.expander("ℹ️ How to use this page", expanded=False):
+        st.markdown("""
+        **Features:**
+        - **Multi-file Selection**: Select multiple source files and dates to display simultaneously
+        - **Inline Editing**: Click any cell to edit its content directly in the table
+        - **Row Selection**: Use checkboxes to select multiple rows to view details
+        - **Save Changes**: After editing cells, click 'Save Changes' to persist modifications
+        - **Search & Filter**: Use the search box and column filters to find specific entries
+        - **Export**: Download filtered or complete database as CSV or Excel
+        
+        **Tips:**
+        - Single-click a cell to start editing
+        - Press Enter or Tab to move to the next cell
+        - All changes are saved back to the original CSV and JSON files
+        - Changes are automatically synced to S3 if configured
+        """)
+    
     # Import AgGrid
     from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
     
@@ -2621,20 +2645,30 @@ elif page == "Database":
     col1, col2 = st.columns(2)
     
     with col1:
-        # Source file filter
-        source_files = ["All"] + sorted(combined_df['source_file'].unique().tolist())
-        selected_source = st.selectbox("Source File", source_files)
+        # Source file filter - changed to multiselect
+        source_files_options = sorted(combined_df['source_file'].unique().tolist())
+        selected_sources = st.multiselect(
+            "Source Files (select one or more)",
+            options=source_files_options,
+            default=source_files_options,  # All selected by default
+            help="Select one or more source files to display"
+        )
     
     with col2:
         # Date range
         if 'processed_date' in combined_df.columns:
             unique_dates = sorted(combined_df['processed_date'].unique())
             if len(unique_dates) > 1:
-                selected_date = st.selectbox("Processed Date", ["All"] + unique_dates)
+                selected_dates = st.multiselect(
+                    "Processed Dates (select one or more)",
+                    options=unique_dates,
+                    default=unique_dates,  # All selected by default
+                    help="Select one or more dates to display"
+                )
             else:
-                selected_date = "All"
+                selected_dates = unique_dates
         else:
-            selected_date = "All"
+            selected_dates = []
     
     # Text search
     search_query = st.text_input("🔎 Search in database", placeholder="Enter keywords...")
@@ -2642,11 +2676,19 @@ elif page == "Database":
     # Apply filters
     filtered_df = combined_df.copy()
     
-    if selected_source != "All":
-        filtered_df = filtered_df[filtered_df['source_file'] == selected_source]
+    # Filter by selected source files
+    if selected_sources:
+        filtered_df = filtered_df[filtered_df['source_file'].isin(selected_sources)]
+    else:
+        # If nothing selected, show nothing
+        filtered_df = filtered_df.iloc[0:0]
     
-    if selected_date != "All":
-        filtered_df = filtered_df[filtered_df['processed_date'] == selected_date]
+    # Filter by selected dates
+    if 'processed_date' in combined_df.columns and selected_dates:
+        filtered_df = filtered_df[filtered_df['processed_date'].isin(selected_dates)]
+    elif 'processed_date' in combined_df.columns and not selected_dates:
+        # If nothing selected, show nothing
+        filtered_df = filtered_df.iloc[0:0]
     
     # Determine which columns will be displayed (exclude hidden columns)
     exclude_cols = ['source_file', 'processed_date', 'content', 'file', 'file_location', 
@@ -2724,7 +2766,8 @@ elif page == "Database":
             resizable=True,
             wrapText=True,
             autoHeight=True,
-            enableCellTextSelection=True
+            enableCellTextSelection=True,
+            editable=True  # Enable editing for all columns by default
         )
         # Configure specific columns
         if 'url' in display_df.columns:
@@ -2735,23 +2778,49 @@ elif page == "Database":
                 wrapText=True,
                 autoHeight=True,
                 cellStyle={'word-break': 'break-all', 'white-space': 'normal'},
-                enableCellTextSelection=True
+                enableCellTextSelection=True,
+                editable=True
             )
         
         if 'Indicator' in display_df.columns:
-            gb.configure_column('Indicator', headerName='Summary/Indicator', width=150, wrapText=True, enableCellTextSelection=True)
+            gb.configure_column(
+                'Indicator', 
+                headerName='Summary/Indicator', 
+                width=150, 
+                wrapText=True, 
+                enableCellTextSelection=True,
+                editable=True
+            )
         
         if 'title' in display_df.columns:
-            gb.configure_column('title', headerName='Title', width=100, wrapText=True, enableCellTextSelection=True)
+            gb.configure_column(
+                'title', 
+                headerName='Title', 
+                width=100, 
+                wrapText=True, 
+                enableCellTextSelection=True,
+                editable=True
+            )
         
         if 'date' in display_df.columns:
-            gb.configure_column('date', headerName='Date', width=100, enableCellTextSelection=True)
+            gb.configure_column(
+                'date', 
+                headerName='Date', 
+                width=100, 
+                enableCellTextSelection=True,
+                editable=True
+            )
         
         # Configure selection
         gb.configure_selection(selection_mode='multiple', use_checkbox=True)
         
-        # Enable text selection
-        gb.configure_grid_options(enableCellTextSelection=True, ensureDomOrder=True)
+        # Enable text selection and editing
+        gb.configure_grid_options(
+            enableCellTextSelection=True, 
+            ensureDomOrder=True,
+            suppressRowClickSelection=True,  # Prevent row selection on cell click (for editing)
+            singleClickEdit=True  # Enable single click to edit
+        )
         
         gridOptions = gb.build()
         
@@ -2759,20 +2828,123 @@ elif page == "Database":
         gridOptions['defaultColDef']['wrapText'] = True
         gridOptions['defaultColDef']['autoHeight'] = True
         gridOptions['defaultColDef']['enableCellTextSelection'] = True
+        gridOptions['defaultColDef']['editable'] = True
         
         # Display AgGrid
         grid_response = AgGrid(
             display_df,
             gridOptions=gridOptions,
             data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            update_mode=GridUpdateMode.MODEL_CHANGED,
+            update_mode=GridUpdateMode.VALUE_CHANGED,  # Changed to capture value changes
             fit_columns_on_grid_load=False,
             theme='streamlit',  # can be 'streamlit' or 'streamlit-dark'
             width=800,
             height=800,
             allow_unsafe_jscode=True,
-            enable_enterprise_modules=False
+            enable_enterprise_modules=False,
+            reload_data=False  # Don't reload data on every interaction
         )
+        
+        # Get edited data
+        edited_df = pd.DataFrame(grid_response['data'])
+        
+        # Check if data was modified
+        data_modified = False
+        if not display_df.equals(edited_df):
+            data_modified = True
+            st.info("⚠️ Data has been modified. Click 'Save Changes' to persist changes to files.")
+        
+        # Save changes button
+        if data_modified:
+            col_save1, col_save2, col_save3 = st.columns([1, 1, 2])
+            with col_save1:
+                if st.button("💾 Save Changes", type="primary", use_container_width=True):
+                    try:
+                        # Map edited data back to original dataframe using URL as key
+                        if 'url' not in edited_df.columns:
+                            st.error("Cannot save: URL column is required for tracking changes")
+                        else:
+                            files_modified = set()
+                            rows_updated = 0
+                            
+                            # Restore the excluded columns to edited_df from filtered_df
+                            # First, create a mapping from display index back to filtered_df
+                            edited_df_with_metadata = edited_df.copy()
+                            
+                            # For each CSV file, update matching rows
+                            for csv_file in csv_files:
+                                try:
+                                    df = pd.read_csv(csv_file)
+                                    original_len = len(df)
+                                    file_modified = False
+                                    
+                                    if 'url' not in df.columns:
+                                        continue
+                                    
+                                    # Update rows that match URLs in edited data
+                                    for idx, edited_row in edited_df.iterrows():
+                                        url = edited_row.get('url')
+                                        if pd.isna(url):
+                                            continue
+                                        
+                                        # Find matching row in CSV
+                                        mask = df['url'] == url
+                                        if mask.any():
+                                            # Update columns that exist in both dataframes
+                                            for col in edited_df.columns:
+                                                if col in df.columns:
+                                                    df.loc[mask, col] = edited_row[col]
+                                            
+                                            file_modified = True
+                                            rows_updated += mask.sum()
+                                    
+                                    if file_modified:
+                                        # Save modified CSV
+                                        df.to_csv(csv_file, index=False)
+                                        files_modified.add(csv_file.name)
+                                        
+                                        # Also update JSON if it exists
+                                        json_file = csv_file.with_suffix('.json')
+                                        if json_file.exists():
+                                            try:
+                                                df.to_json(json_file, orient='records', indent=2)
+                                            except Exception as e:
+                                                st.warning(f"Could not update {json_file.name}: {e}")
+                                
+                                except Exception as e:
+                                    st.warning(f"Error processing {csv_file.name}: {e}")
+                            
+                            # Upload modified files to S3
+                            if files_modified:
+                                try:
+                                    from aws_storage import get_storage
+                                    s3_storage = get_storage()
+                                    
+                                    for file_name in files_modified:
+                                        csv_path = summarised_dir / file_name
+                                        s3_key = f"summarised_content/{file_name}"
+                                        s3_storage.upload_file(str(csv_path), s3_key)
+                                        
+                                        # Also upload JSON if it exists
+                                        json_name = file_name.replace('.csv', '.json')
+                                        json_path = summarised_dir / json_name
+                                        if json_path.exists():
+                                            s3_json_key = f"summarised_content/{json_name}"
+                                            s3_storage.upload_file(str(json_path), s3_json_key)
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not sync to S3: {e}")
+                            
+                            # Clear cache and refresh
+                            load_all_csvs.clear()
+                            st.success(f"✅ Successfully saved changes to {rows_updated} row(s) across {len(files_modified)} file(s)")
+                            st.rerun()
+                    
+                    except Exception as e:
+                        st.error(f"Error saving changes: {e}")
+            
+            with col_save2:
+                if st.button("🔄 Discard Changes", use_container_width=True):
+                    st.rerun()
         
         # Show selection info if any rows are selected
         selected_rows = grid_response['selected_rows']
@@ -2863,6 +3035,10 @@ elif page == "RAG":
         st.session_state.rag_llm_provider = "azure_openai"  # Default to Azure OpenAI
     if "rag_lm_studio_url" not in st.session_state:
         st.session_state.rag_lm_studio_url = "http://127.0.0.1:1234/v1"
+    if "rag_chunk_size" not in st.session_state:
+        st.session_state.rag_chunk_size = 1024
+    if "rag_chunk_overlap" not in st.session_state:
+        st.session_state.rag_chunk_overlap = 200
     if "rag_system" not in st.session_state:
         from embeddings_rag import LlamaIndexRAG
         import os
@@ -2873,7 +3049,8 @@ elif page == "RAG":
         rag_params = {
             "persist_dir": "rag_storage",
             "llm_provider": st.session_state.rag_llm_provider,
-            "use_azure_embeddings": True  # Use Azure OpenAI for embeddings
+            "chunk_size": st.session_state.rag_chunk_size,
+            "chunk_overlap": st.session_state.rag_chunk_overlap
         }
         
         if st.session_state.rag_llm_provider == "azure_openai":
@@ -2974,26 +3151,31 @@ elif page == "RAG":
                         llm_provider=llm_provider,
                         azure_deployment=azure_deployment,
                         embedding_model=embedding_deployment,
-                        use_azure_embeddings=True
+                        chunk_size=st.session_state.rag_chunk_size,
+                        chunk_overlap=st.session_state.rag_chunk_overlap
                     )
                 elif llm_provider == "lm_studio":
                     st.session_state.rag_system = LlamaIndexRAG(
                         persist_dir="rag_storage",
                         llm_provider=llm_provider,
                         lm_studio_base_url=lm_studio_url,
-                        use_azure_embeddings=True,
-                        embedding_model=embedding_deployment
+                        embedding_model=embedding_deployment,
+                        chunk_size=st.session_state.rag_chunk_size,
+                        chunk_overlap=st.session_state.rag_chunk_overlap
                     )
                 else:  # openai
                     st.session_state.rag_system = LlamaIndexRAG(
                         persist_dir="rag_storage",
                         llm_provider=llm_provider,
-                        use_azure_embeddings=True,
-                        embedding_model=embedding_deployment
+                        embedding_model=embedding_deployment,
+                        chunk_size=st.session_state.rag_chunk_size,
+                        chunk_overlap=st.session_state.rag_chunk_overlap
                     )
                 
+                # Show which provider is being used for embeddings
+                embedding_provider = os.getenv("EMBEDDING_PROVIDER", llm_provider)
                 st.success(f"✓ Switched to {llm_provider.upper()} for response generation")
-                st.info("ℹ️ Embeddings use Azure OpenAI")
+                st.info(f"ℹ️ Embeddings use {embedding_provider.upper()}")
                 st.rerun()
         
         st.caption("💡 **Note:** Embeddings use Azure OpenAI (text-embedding-3-large)")
@@ -3005,6 +3187,69 @@ elif page == "RAG":
         if st.session_state.rag_llm_provider == "lm_studio":
             config_status += f"\n- LM Studio URL: {st.session_state.rag_lm_studio_url}"
         st.info(config_status)
+        
+        st.divider()
+        
+        # Chunk size configuration
+        st.subheader("📝 Text Chunking")
+        
+        if "rag_chunk_size" not in st.session_state:
+            st.session_state.rag_chunk_size = 2048
+        if "rag_chunk_overlap" not in st.session_state:
+            st.session_state.rag_chunk_overlap = 400
+        
+        chunk_size = st.number_input(
+            "Chunk Size (tokens)",
+            min_value=256,
+            max_value=4096,
+            value=st.session_state.rag_chunk_size,
+            step=128,
+            help="Size of text chunks for embedding. Smaller chunks = more precise but more embeddings. Larger chunks = more context but less precise."
+        )
+        
+        chunk_overlap = st.number_input(
+            "Chunk Overlap (tokens)",
+            min_value=0,
+            max_value=512,
+            value=st.session_state.rag_chunk_overlap,
+            step=50,
+            help="Overlap between consecutive chunks. Helps maintain context across chunk boundaries."
+        )
+        
+        # Apply chunk size changes
+        if chunk_size != st.session_state.rag_chunk_size or chunk_overlap != st.session_state.rag_chunk_overlap:
+            if st.button("🔄 Apply Chunking Settings", type="secondary", use_container_width=True):
+                st.session_state.rag_chunk_size = chunk_size
+                st.session_state.rag_chunk_overlap = chunk_overlap
+                
+                # Reinitialize RAG system with new chunk settings
+                from embeddings_rag import LlamaIndexRAG
+                
+                embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+                
+                rag_params = {
+                    "persist_dir": "rag_storage",
+                    "llm_provider": st.session_state.rag_llm_provider,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap
+                }
+                
+                if st.session_state.rag_llm_provider == "azure_openai":
+                    rag_params["azure_deployment"] = azure_deployment
+                    rag_params["embedding_model"] = embedding_deployment
+                elif st.session_state.rag_llm_provider == "lm_studio":
+                    rag_params["lm_studio_base_url"] = st.session_state.rag_lm_studio_url
+                    rag_params["embedding_model"] = embedding_deployment
+                else:  # openai
+                    rag_params["embedding_model"] = embedding_deployment
+                
+                st.session_state.rag_system = LlamaIndexRAG(**rag_params)
+                
+                st.success(f"✓ Updated chunking: {chunk_size} tokens with {chunk_overlap} overlap")
+                st.warning("⚠️ Note: Existing indexes won't be affected. Rebuild indexes to use new chunk settings.")
+                st.rerun()
+        
+        st.caption(f"Current: {st.session_state.rag_chunk_size} tokens, {st.session_state.rag_chunk_overlap} overlap")
         
         st.divider()
         
@@ -3022,8 +3267,9 @@ elif page == "RAG":
             rag_params = {
                 "persist_dir": "rag_storage",
                 "llm_provider": st.session_state.rag_llm_provider,
-                "use_azure_embeddings": True,
-                "embedding_model": embedding_deployment
+                "embedding_model": embedding_deployment,
+                "chunk_size": st.session_state.rag_chunk_size,
+                "chunk_overlap": st.session_state.rag_chunk_overlap
             }
             
             if st.session_state.rag_llm_provider == "azure_openai":
@@ -4037,6 +4283,8 @@ elif page == "LinkedIn Home Feed Monitor":
                 (r'(\d+)\s*mo(?:nth)?s?\s*(?:ago)?', 'months'),
                 (r'(\d+)\s*y(?:ear)?s?\s*(?:ago)?', 'years'),
             ]
+            
+            post_time = now  # Initialize with current time
             
             for pattern, unit in patterns:
                 match = re.search(pattern, text)

@@ -19,6 +19,7 @@ from llama_index.core import (
     load_index_from_storage,
     Settings
 )
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 
@@ -33,13 +34,9 @@ except ImportError:
 try:
     from llama_index.llms.azure_openai import AzureOpenAI
 except ImportError:
-    try:
-        # Try newer import path
-        from llama_index.llms.openai import AzureOpenAI
-    except ImportError:
-        # Fallback - will use OpenAI instead
-        AzureOpenAI = None
-        print("Warning: AzureOpenAI import failed, will use OpenAI instead")
+    # Fallback - will use OpenAI instead
+    AzureOpenAI = None  # type: ignore
+    print("Warning: AzureOpenAI import failed, will use OpenAI instead")
 
 from dotenv import load_dotenv
 import os
@@ -69,46 +66,74 @@ class LlamaIndexRAG:
         self,
         persist_dir: str = "rag_storage",
         embedding_model: str = "text-embedding-3-large",
-        llm_provider: str = "azure_openai",  # "azure_openai", "openai", or "lm_studio"
+        llm_provider: Optional[str] = None,  # "azure_openai", "openai", or "lm_studio" (auto-detect from env)
         llm_model: str = "gpt-4o-mini",
         lm_studio_base_url: str = "http://127.0.0.1:1234/v1",
-        azure_deployment: str = None,  # Azure deployment name for LLM
+        azure_deployment: Optional[str] = None,  # Azure deployment name for LLM
         azure_api_version: str = "2024-02-15-preview",
-        use_azure_embeddings: bool = True,  # Use Azure OpenAI for embeddings
-        enable_s3_sync: bool = True  # Enable automatic S3 sync for embeddings
+        embedding_provider: Optional[str] = None,  # "azure" or "openai" (auto-detect from env if None)
+        enable_s3_sync: bool = True,  # Enable automatic S3 sync for embeddings
+        chunk_size: int = 2048,  # Size of text chunks for embedding
+        chunk_overlap: int = 400  # Overlap between consecutive chunks
     ):
         """
         Initialize RAG system with LlamaIndex.
         
         Args:
             persist_dir: Directory to persist vector index
-            embedding_model: Embedding model name (Azure deployment name if use_azure_embeddings=True)
-            llm_provider: LLM provider - "azure_openai", "openai", or "lm_studio"
+            embedding_model: Embedding model name (Azure deployment name if using Azure, or OpenAI model name)
+            llm_provider: LLM provider - "azure_openai", "openai", or "lm_studio" (auto-detect from LLM_PROVIDER env if None)
             llm_model: LLM model name
             lm_studio_base_url: Base URL for LM Studio API (if using lm_studio)
             azure_deployment: Azure OpenAI deployment name for LLM (if using azure_openai)
             azure_api_version: Azure OpenAI API version
-            use_azure_embeddings: Use Azure OpenAI for embeddings (default: True)
+            embedding_provider: Embedding provider - "azure" or "openai" (auto-detect from EMBEDDING_PROVIDER env if None)
             enable_s3_sync: Enable automatic S3 sync for embeddings (default: True)
+            chunk_size: Size of text chunks for embedding (default: 1024 tokens)
+            chunk_overlap: Overlap between consecutive chunks (default: 200 tokens)
         """
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Auto-detect providers from environment if not specified
+        if llm_provider is None:
+            llm_provider = os.getenv("LLM_PROVIDER", "azure_openai").lower()
+            # Normalize provider names
+            if llm_provider == "azure":
+                llm_provider = "azure_openai"
+        
+        if embedding_provider is None:
+            # First check for explicit embedding provider setting
+            embedding_provider = os.getenv("EMBEDDING_PROVIDER", "").lower()
+            # If not set, use same as LLM provider by default
+            if not embedding_provider:
+                if llm_provider == "azure_openai":
+                    embedding_provider = "azure"
+                elif llm_provider == "openai":
+                    embedding_provider = "openai"
+                else:
+                    # For lm_studio or others, default to openai embeddings
+                    embedding_provider = "openai"
+        
         self.llm_provider = llm_provider
-        self.use_azure_embeddings = use_azure_embeddings
+        self.embedding_provider = embedding_provider
         self.enable_s3_sync = enable_s3_sync and HAS_S3
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
         
         # Initialize S3 storage if enabled
         self.s3_storage = None
         if self.enable_s3_sync:
             try:
+                from aws_storage import S3Storage
                 self.s3_storage = S3Storage()
                 logger.info("✓ S3 sync enabled for RAG embeddings")
             except Exception as e:
                 logger.warning(f"S3 storage initialization failed: {e}. Falling back to local-only storage.")
                 self.enable_s3_sync = False
         
-        # Configure embeddings
-        if use_azure_embeddings:
+        # Configure embeddings based on provider
+        if self.embedding_provider == "azure":
             # Use Azure OpenAI for embeddings
             if not AzureOpenAIEmbedding:
                 raise ImportError(
@@ -124,10 +149,9 @@ class LlamaIndexRAG:
             if not azure_embedding_api_key or not azure_embedding_endpoint:
                 raise ValueError(
                     "Azure OpenAI embeddings configuration missing. "
-                    "Please set AZURE_OPENAI_EMBEDDING_API_KEY and AZURE_OPENAI_EMBEDDING_ENDPOINT in your .env file."
+                    "Please set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT (or specific AZURE_OPENAI_EMBEDDING_* variants) in your .env file."
                 )
             
-            # Use AzureOpenAIEmbedding class for Azure
             Settings.embed_model = AzureOpenAIEmbedding(
                 model=azure_embedding_deployment,
                 deployment_name=azure_embedding_deployment,
@@ -135,9 +159,9 @@ class LlamaIndexRAG:
                 azure_endpoint=azure_embedding_endpoint,
                 api_version=azure_embedding_version
             )
-            print(f"✓ Using Azure OpenAI embeddings: {azure_embedding_deployment}")
-            print(f"  Endpoint: {azure_embedding_endpoint}")
-            print(f"  API Version: {azure_embedding_version}")
+            logger.info(f"✓ Using Azure OpenAI embeddings: {azure_embedding_deployment}")
+            logger.info(f"  Endpoint: {azure_embedding_endpoint}")
+            logger.info(f"  API Version: {azure_embedding_version}")
         else:
             # Use standard OpenAI for embeddings
             openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -152,7 +176,7 @@ class LlamaIndexRAG:
                 model=embedding_model,
                 api_key=openai_api_key
             )
-            print(f"✓ Using OpenAI embeddings: {embedding_model}")
+            logger.info(f"✓ Using OpenAI embeddings: {embedding_model}")
         
         # Configure LLM based on provider
         if llm_provider == "azure_openai":
@@ -185,9 +209,9 @@ class LlamaIndexRAG:
                 temperature=0.7
             )
             self.llm_model_name = azure_llm_deployment
-            print(f"✓ Using Azure OpenAI LLM: {self.llm_model_name}")
-            print(f"  Endpoint: {azure_endpoint}")
-            print(f"  API Version: {azure_api_version}")
+            logger.info(f"✓ Using Azure OpenAI LLM: {self.llm_model_name}")
+            logger.info(f"  Endpoint: {azure_endpoint}")
+            logger.info(f"  API Version: {azure_api_version}")
         elif llm_provider == "lm_studio":
             # Use LM Studio for generation
             # Store original key
@@ -211,14 +235,28 @@ class LlamaIndexRAG:
                 os.environ["OPENAI_API_KEY"] = original_openai_key
             
             self.llm_model_name = llm_model
-            print(f"✓ Using LM Studio LLM: {self.llm_model_name}")
+            logger.info(f"✓ Using LM Studio LLM: {self.llm_model_name}")
         else:
             # Use OpenAI for generation
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            
+            if not openai_api_key:
+                raise ValueError("OPENAI_API_KEY is required for OpenAI LLM provider")
+            
             Settings.llm = OpenAI(
                 model=llm_model,
-                api_key=original_openai_key
+                api_key=openai_api_key,
+                temperature=0.7
             )
             self.llm_model_name = llm_model
+            logger.info(f"✓ Using OpenAI LLM: {self.llm_model_name}")
+        
+        # Configure text splitter for chunking
+        Settings.text_splitter = SentenceSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap
+        )
+        logger.info(f"✓ Configured text splitter: chunk_size={self.chunk_size}, chunk_overlap={self.chunk_overlap}")
         
         self.embedding_model_name = embedding_model
         self.index: Optional[VectorStoreIndex] = None
@@ -233,7 +271,7 @@ class LlamaIndexRAG:
             query: User query string
             
         Returns:
-            Dictionary with detected intent: {'sort_by_date': bool, 'filter_source': str or None}
+            Dictionary with detected intent: {'sort_by_date': bool, 'filter_source': str or None, 'filter_metadata': dict}
         """
         query_lower = query.lower()
         
@@ -253,12 +291,35 @@ class LlamaIndexRAG:
         if any(keyword in query_lower for keyword in temporal_keywords):
             intent['sort_by_date'] = True
         
+        # Detect high-impact queries
+        if 'high impact' in query_lower or 'high-impact' in query_lower:
+            intent['filter_metadata']['impact'] = 'high'
+        
+        # Detect TRL level queries (e.g., "commercial", "deployed", "production", "research")
+        if 'commercial' in query_lower or 'deployed' in query_lower or 'production' in query_lower:
+            intent['filter_metadata']['trl'] = '8'  # High TRL
+        elif 'research' in query_lower or 'poc' in query_lower or 'proof of concept' in query_lower:
+            intent['filter_metadata']['trl'] = '3'  # Low TRL (research)
+        
+        # Detect sentiment filters
+        if 'positive' in query_lower:
+            intent['filter_metadata']['sentiment'] = 'positive'
+        elif 'negative' in query_lower:
+            intent['filter_metadata']['sentiment'] = 'negative'
+        
         # Detect source-specific queries
         # Extract source names from loaded indexes
         if self.current_index_name:
             source_name = self.current_index_name.rsplit('_', 1)[0]
-            if source_name in query_lower:
+            # Check for source name in query (exact or partial match)
+            source_name_lower = source_name.lower()
+            if source_name_lower in query_lower:
                 intent['filter_source'] = source_name
+                logger.info(f"Detected source filter for: {source_name}")
+            # Also check with underscores replaced by spaces
+            elif source_name_lower.replace('_', ' ') in query_lower or source_name_lower.replace('-', ' ') in query_lower:
+                intent['filter_source'] = source_name
+                logger.info(f"Detected source filter for: {source_name}")
         
         return intent
 
@@ -401,8 +462,8 @@ class LlamaIndexRAG:
         Returns:
             Number of documents indexed
         """
-        json_path = Path(json_path)
-        index_name = json_path.stem  # Use JSON filename as index identifier
+        json_path_obj = Path(json_path)
+        index_name = json_path_obj.stem  # Use JSON filename as index identifier
         index_dir = self.persist_dir / index_name
         
         # Check if index already exists locally
@@ -415,7 +476,7 @@ class LlamaIndexRAG:
                 storage_context = StorageContext.from_defaults(
                     persist_dir=str(index_dir)
                 )
-                self.index = load_index_from_storage(storage_context)
+                self.index = load_index_from_storage(storage_context)  # type: ignore
                 self.current_index_name = index_name
                 
                 # Count documents by loading docstore
@@ -439,7 +500,7 @@ class LlamaIndexRAG:
                     storage_context = StorageContext.from_defaults(
                         persist_dir=str(index_dir)
                     )
-                    self.index = load_index_from_storage(storage_context)
+                    self.index = load_index_from_storage(storage_context)  # type: ignore
                     self.current_index_name = index_name
                     
                     doc_count = len(storage_context.docstore.docs)
@@ -455,7 +516,7 @@ class LlamaIndexRAG:
         if progress_callback:
             progress_callback("Loading JSON file...", 0, 100)
         
-        with open(json_path, 'r', encoding='utf-8') as f:
+        with open(json_path_obj, 'r', encoding='utf-8') as f:
             articles = json.load(f)
         
         documents = []
@@ -465,27 +526,81 @@ class LlamaIndexRAG:
             progress_callback(f"Processing {total} documents...", 0, total)
         
         for i, article in enumerate(articles, 1):
-            # Extract metadata
+            # Extract metadata from JSON structure (case-insensitive)
+            title = article.get('Title') or article.get('title') or article.get('headline') or ''
+            url = article.get('URL') or article.get('url') or article.get('link') or ''
+            publication_date = article.get('Published Date') or article.get('publication_date') or article.get('date') or article.get('Date') or article.get('pubDate') or ''
+            
             metadata = {
-                'title': article.get('title') or article.get('Title') or article.get('headline') or '',
-                'url': article.get('url') or article.get('link') or '',
+                'title': title,
+                'url': url,
                 'filename': article.get('filename') or article.get('file') or article.get('file_name') or '',
-                'publication_date': article.get('publication_date') or article.get('date') or article.get('Date') or article.get('pubDate') or '',
+                'publication_date': publication_date,
                 'dimension': article.get('Dimension') or article.get('dimension') or '',
                 'tech': article.get('Tech') or article.get('tech') or '',
                 'trl': str(article.get('TRL') or article.get('trl') or ''),
                 'startup': article.get('Start-up') or article.get('Start_up') or article.get('start_up') or '',
                 'indicator': article.get('Indicator') or article.get('indicator') or '',
+                'impact': article.get('Impact') or article.get('impact') or '',
+                'sentiment': article.get('Sentiment') or article.get('sentiment') or '',
+                'company': article.get('Company') or article.get('company') or '',
+                'categories': article.get('categories') or article.get('Categories') or '',
             }
             
-            # Build content with Indicator and raw content
-            indicator = article.get('Indicator', '')
-            raw_content = article.get('content', '')
+            # Build rich text content from JSON structure
+            text_parts = []
             
-            # Create full text
-            full_text = f"Indicator:\n{indicator}\n\nRaw Content:\n{raw_content}"
+            # Title
+            if title:
+                text_parts.append(f"# {title}")
             
-            # Create Document
+            # Metadata section
+            text_parts.append("\n**Metadata:**")
+            if url:
+                text_parts.append(f"- URL: {url}")
+            if publication_date:
+                text_parts.append(f"- Published: {publication_date}")
+            if metadata['company']:
+                text_parts.append(f"- Company: {metadata['company']}")
+            if metadata['tech']:
+                text_parts.append(f"- Technology: {metadata['tech']}")
+            if metadata['trl']:
+                text_parts.append(f"- TRL: {metadata['trl']}")
+            if metadata['impact']:
+                text_parts.append(f"- Impact: {metadata['impact']}")
+            if metadata['sentiment']:
+                text_parts.append(f"- Sentiment: {metadata['sentiment']}")
+            if metadata['dimension']:
+                text_parts.append(f"- Dimension: {metadata['dimension']}")
+            
+            # Indicator (tech intelligence summary)
+            indicator = article.get('Indicator') or article.get('indicator') or ''
+            if indicator:
+                text_parts.append(f"\n**Summary (Indicator):**\n{indicator}")
+            
+            # Key insights
+            key_insights = article.get('Key Insights') or article.get('key_insights') or []
+            if key_insights:
+                if isinstance(key_insights, list):
+                    insights_text = "\n".join(f"- {insight}" for insight in key_insights)
+                else:
+                    insights_text = str(key_insights)
+                text_parts.append(f"\n**Key Insights:**\n{insights_text}")
+            
+            # Relevance/Analysis
+            relevance = article.get('Relevance') or article.get('relevance') or ''
+            if relevance:
+                text_parts.append(f"\n**Relevance:**\n{relevance}")
+            
+            # Raw content
+            raw_content = article.get('content') or article.get('Content') or ''
+            if raw_content:
+                text_parts.append(f"\n**Full Content:**\n{raw_content}")
+            
+            # Combine all text
+            full_text = "\n".join(text_parts)
+            
+            # Create Document with rich metadata for filtering
             doc = Document(
                 text=full_text,
                 metadata=metadata,
@@ -543,7 +658,7 @@ class LlamaIndexRAG:
         self,
         query_text: str,
         top_k: int = 3,
-        sort_by_date: bool = None,
+        sort_by_date: Optional[bool] = None,
         filter_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -565,40 +680,27 @@ class LlamaIndexRAG:
         if sort_by_date is None:
             intent = self._detect_query_intent(query_text)
             sort_by_date = intent['sort_by_date']
-            if not filter_metadata and intent['filter_source']:
-                filter_metadata = {}  # Will be handled by source filtering
+            if not filter_metadata and intent['filter_metadata']:
+                filter_metadata = intent['filter_metadata']  # Use detected metadata filters
         
-        # Create query engine with custom prompt
+        # Import PromptTemplate for later use
         from llama_index.core.prompts import PromptTemplate
         
         # Build source mapping for citations (website names from index)
         source_name = self.current_index_name.rsplit('_', 1)[0] if self.current_index_name else "Source"
         
-        qa_prompt_str = (
-            "Context information is below.\n"
-            "---------------------\n"
-            "{context_str}\n"
-            "---------------------\n"
-            "Given the context information and not prior knowledge, "
-            "answer the question. You MUST cite your sources using markdown hyperlink format: [Source Name](URL). "
-            f"Each context document contains metadata with a 'url' field that you should use. "
-            "For example: 'According to [" + source_name + "](https://example.com/article), the technology...' "
-            "Always include source citations with hyperlinks when referencing information. "
-            "Use the actual URL from the document's metadata.\n\n"
-            "Question: {query_str}\n"
-            "Answer: "
-        )
-        
-        qa_prompt = PromptTemplate(qa_prompt_str)
-        
         # If we need date sorting or filtering, retrieve more documents first
-        retrieval_top_k = top_k * 3 if (sort_by_date or filter_metadata) else top_k
+        # Retrieve 5x more documents so we have enough after sorting/filtering
+        retrieval_top_k = max(top_k * 5, 15) if (sort_by_date or filter_metadata) else top_k
+        
+        logger.info(f"Query: '{query_text}' | Retrieving {retrieval_top_k} documents (sort_by_date={sort_by_date}, filters={bool(filter_metadata)})")
         
         # Create retriever
         retriever = self.index.as_retriever(similarity_top_k=retrieval_top_k)
         
         # Retrieve nodes
         nodes = retriever.retrieve(query_text)
+        logger.info(f"Retrieved {len(nodes)} nodes from index")
         
         # Apply metadata filtering if specified
         if filter_metadata:
@@ -608,6 +710,7 @@ class LlamaIndexRAG:
                 for key, value in filter_metadata.items():
                     node_value = node.node.metadata.get(key, '')
                     if isinstance(value, str):
+                        # Use fuzzy matching - check if value is a substring (case-insensitive)
                         if value.lower() not in str(node_value).lower():
                             match = False
                             break
@@ -616,9 +719,15 @@ class LlamaIndexRAG:
                         break
                 if match:
                     filtered_nodes.append(node)
-            nodes = filtered_nodes
+            
+            # Only use filtered nodes if we have matches, otherwise fall back to all retrieved nodes
+            if filtered_nodes:
+                nodes = filtered_nodes
+                logger.info(f"Metadata filtering: {len(filtered_nodes)} of {retrieval_top_k} nodes matched filters {filter_metadata}")
+            else:
+                logger.info(f"No nodes matched metadata filters {filter_metadata}, using all retrieved nodes")
         
-        # Sort by date if requested
+        # Sort by date if requested (check both 'publication_date' and 'date' fields)
         if sort_by_date:
             from dateutil import parser
             
@@ -632,27 +741,55 @@ class LlamaIndexRAG:
                     return datetime.min
             
             nodes.sort(
-                key=lambda x: parse_date(x.node.metadata.get('date', '')),
+                key=lambda x: parse_date(
+                    x.node.metadata.get('publication_date') or x.node.metadata.get('date') or ''
+                ),
                 reverse=True  # Most recent first
             )
         
         # Take top K after filtering/sorting
         nodes = nodes[:top_k]
         
-        # Create query engine and synthesize response
-        query_engine = self.index.as_query_engine(
-            similarity_top_k=top_k,
-            response_mode="compact",
+        # Build list of available URLs from retrieved documents
+        available_urls = []
+        for node in nodes:
+            url = node.node.metadata.get('url', '')
+            title = node.node.metadata.get('title', 'Article')
+            if url:
+                available_urls.append(f"- {title}: {url}")
+        
+        available_urls_str = "\n".join(available_urls) if available_urls else "No URLs available"
+        
+        # Update prompt with actual available URLs
+        qa_prompt_str = (
+            "Context information is below.\n"
+            "---------------------\n"
+            "{context_str}\n"
+            "---------------------\n"
+            "Given the context information and not prior knowledge, answer the question.\n\n"
+            "IMPORTANT CITATION RULES:\n"
+            "1. You MUST cite sources inline within your answer using markdown hyperlink format: [text](URL)\n"
+            "2. ONLY use URLs from this list of retrieved documents:\n"
+            f"{available_urls_str}\n\n"
+            "3. DO NOT create, modify, or hallucinate URLs - use ONLY the exact URLs listed above\n"
+            "4. Cite sources immediately after stating facts or information from them\n"
+            "5. Format: 'According to [article title](exact_url), the technology...'\n"
+            f"6. Example: 'Studies show that solar efficiency has improved ([{source_name}](https://example.com/article))'\n\n"
+            "Do NOT just list sources at the end. Integrate citations throughout your answer where you use information.\n\n"
+            "Question: {query_str}\n"
+            "Answer: "
         )
         
-        # Update prompt
-        query_engine.update_prompts({"response_synthesizer:text_qa_template": qa_prompt})
+        qa_prompt = PromptTemplate(qa_prompt_str)
         
-        # Synthesize response from the filtered/sorted nodes
-        from llama_index.core.schema import NodeWithScore
+        # Synthesize response from the filtered/sorted nodes using our custom prompt
         from llama_index.core import get_response_synthesizer
+        from llama_index.core.response_synthesizers import ResponseMode
         
-        response_synthesizer = get_response_synthesizer(response_mode="compact")
+        response_synthesizer = get_response_synthesizer(
+            response_mode=ResponseMode.COMPACT,
+            text_qa_template=qa_prompt
+        )
         response = response_synthesizer.synthesize(query_text, nodes)
         
         # Extract source nodes (retrieved documents)
@@ -667,7 +804,7 @@ class LlamaIndexRAG:
             retrieved_docs.append({
                 'id': idx - 1,
                 'score': node.score if hasattr(node, 'score') else 0.0,
-                'text': node.node.text,
+                'text': node.node.text,  # type: ignore
                 'metadata': metadata,
                 'doc_id': node.node.id_
             })
@@ -719,11 +856,12 @@ class LlamaIndexRAG:
                     
                     # Try to get S3 file metadata
                     try:
-                        s3_key = f"rag_embeddings/{s3_name}.zip"
-                        file_meta = self.s3_storage.get_file_metadata(s3_key)
-                        if file_meta:
-                            metadata['created_at'] = file_meta['last_modified'].isoformat()
-                            metadata['size'] = file_meta['size']
+                        if self.s3_storage:
+                            s3_key = f"rag_embeddings/{s3_name}.zip"
+                            file_meta = self.s3_storage.get_file_metadata(s3_key)
+                            if file_meta:
+                                metadata['created_at'] = file_meta['last_modified'].isoformat()
+                                metadata['size'] = file_meta['size']
                     except Exception as e:
                         logger.debug(f"Could not get S3 metadata for {s3_name}: {e}")
                     
@@ -757,7 +895,7 @@ class LlamaIndexRAG:
         storage_context = StorageContext.from_defaults(
             persist_dir=str(index_dir)
         )
-        self.index = load_index_from_storage(storage_context)
+        self.index = load_index_from_storage(storage_context)  # type: ignore
         self.current_index_name = index_name
         
         # Count documents
@@ -787,7 +925,7 @@ class LlamaIndexRAG:
                 del self.loaded_indexes[index_name]
         
         # Delete from S3
-        if delete_from_s3 and self.enable_s3_sync:
+        if delete_from_s3 and self.enable_s3_sync and self.s3_storage:
             s3_key = f"rag_embeddings/{index_name}.zip"
             if self.s3_storage.delete_file(s3_key):
                 logger.info(f"✓ Deleted S3 index: {index_name}")
@@ -820,7 +958,7 @@ class LlamaIndexRAG:
         query: str,
         index_names: List[str],
         top_k: int = 3,
-        sort_by_date: bool = None
+        sort_by_date: Optional[bool] = None
     ) -> Dict[str, Any]:
         """
         Query multiple indexes and merge results.
@@ -849,7 +987,7 @@ class LlamaIndexRAG:
                     storage_context = StorageContext.from_defaults(
                         persist_dir=str(index_dir)
                     )
-                    self.loaded_indexes[index_name] = load_index_from_storage(storage_context)
+                    self.loaded_indexes[index_name] = load_index_from_storage(storage_context)  # type: ignore
                 except Exception as e:
                     continue
             
@@ -861,7 +999,7 @@ class LlamaIndexRAG:
                 
                 # Add source information to each node
                 for node in nodes:
-                    node.metadata['source_index'] = index_name
+                    node.node.metadata['source_index'] = index_name
                     all_results.append(node)
             except Exception as e:
                 continue
@@ -879,7 +1017,9 @@ class LlamaIndexRAG:
                     return datetime.min
             
             all_results.sort(
-                key=lambda x: parse_date(x.metadata.get('date', '')),
+                key=lambda x: parse_date(
+                    x.node.metadata.get('publication_date') or x.node.metadata.get('date') or ''
+                ),
                 reverse=True  # Most recent first
             )
         else:
@@ -893,30 +1033,43 @@ class LlamaIndexRAG:
         if top_results:
             # Build source name mapping for citations
             source_citations = {}
+            available_urls = []
+            
             for node in top_results:
-                source_index = node.metadata.get('source_index', 'Unknown')
+                source_index = node.node.metadata.get('source_index', 'Unknown')
                 # Extract website name (remove date suffix)
                 website_name = source_index.rsplit('_', 1)[0]
                 if website_name not in source_citations:
                     source_citations[website_name] = source_index
+                
+                # Collect URLs
+                url = node.node.metadata.get('url', '')
+                title = node.node.metadata.get('title', 'Article')
+                if url:
+                    available_urls.append(f"- [{website_name}] {title}: {url}")
             
-            # Create custom prompt with source names
+            # Create custom prompt with actual URLs from retrieved documents
             from llama_index.core.prompts import PromptTemplate
             
             source_list = ", ".join([f"[{name}]" for name in source_citations.keys()])
+            available_urls_str = "\n".join(available_urls) if available_urls else "No URLs available"
             
             qa_prompt_str = (
                 "Context information is below.\n"
                 "---------------------\n"
                 "{context_str}\n"
                 "---------------------\n"
-                "Given the context information and not prior knowledge, "
-                "answer the question. You MUST cite your sources using markdown hyperlink format: [Source Name](URL). "
-                f"The available sources are: {source_list}. "
-                "Each context document contains metadata with a 'url' field that you should use for the hyperlink. "
-                "For example: 'According to [canarymedia](https://example.com/article), the technology...' "
-                "Use the appropriate source name and URL based on which document the information comes from. "
-                "Always include source citations with hyperlinks when referencing information.\n\n"
+                "Given the context information and not prior knowledge, answer the question.\n\n"
+                "IMPORTANT CITATION RULES:\n"
+                "1. You MUST cite sources inline within your answer using markdown hyperlink format: [text](URL)\n"
+                f"2. Available sources: {source_list}\n"
+                "3. ONLY use URLs from this list of retrieved documents:\n"
+                f"{available_urls_str}\n\n"
+                "4. DO NOT create, modify, or hallucinate URLs - use ONLY the exact URLs listed above\n"
+                "5. Cite sources immediately after stating facts or information from them\n"
+                "6. Format: 'According to [source name](exact_url), the development...'\n"
+                "7. Example: 'Recent research shows ([canarymedia](https://example.com/article)) that carbon capture...'\n\n"
+                "Do NOT just list sources at the end. Integrate citations throughout your answer where you use information.\n\n"
                 "Question: {query_str}\n"
                 "Answer: "
             )
@@ -924,9 +1077,10 @@ class LlamaIndexRAG:
             qa_prompt = PromptTemplate(qa_prompt_str)
             
             # Create a query engine from the primary index (or first loaded)
-            primary_index = self.loaded_indexes.get(
-                index_names[0] if index_names else None
-            ) or self.index
+            first_index_name = index_names[0] if index_names else None
+            primary_index = self.loaded_indexes.get(first_index_name) if first_index_name else None
+            if not primary_index:
+                primary_index = self.index
             
             if primary_index:
                 query_engine = primary_index.as_query_engine(
