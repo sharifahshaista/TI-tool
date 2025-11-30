@@ -2,8 +2,9 @@ import asyncio
 import os
 from agents.clarification import get_clarifications
 from agents.serp import get_serp_queries
-from config.searxng_tools import searxng_web_tool
+from config.searxng_tools import searxng_web_tool, searxng_client
 from schemas.datamodel import SearchResultsCollection
+from pydantic import ValidationError
 
 import logging
 import json 
@@ -19,7 +20,7 @@ logging.basicConfig(level=logging.INFO,
 
 
 
-async def clarify_and_search(topic:str, filename:str = None):
+async def clarify_and_search(topic: str, filename: str | None = None):
     """Main execution function with proper error handling"""
     try:
         topic = topic
@@ -45,7 +46,7 @@ async def clarify_and_search(topic:str, filename:str = None):
             logging.info(f"\nSearching for: {query}")
 
             try:
-                results = await searxng_web_tool(None, query)
+                results = await searxng_client._search(query)
                 logging.info(f"Found results for query: {results}")
 
                 # Add to collection
