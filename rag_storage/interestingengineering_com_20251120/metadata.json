@@ -1,8 +1,0 @@
-{
-  "source_file": "summarised_content/interestingengineering_com_20251120.json",
-  "num_documents": 344,
-  "created_at": "2025-11-20T12:15:29.645138",
-  "embedding_model": "text-embedding-3-large",
-  "llm_provider": "azure_openai",
-  "llm_model": "pmo-gpt-4.1-nano"
-}

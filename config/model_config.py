@@ -1,17 +1,17 @@
 """
 Model Configuration
-Supports Azure OpenAI, OpenAI, and LM Studio (OpenAI-compatible)
+Supports OpenAI, and LM Studio (OpenAI-compatible)
 """
 
 import os
-from typing import Union
+from typing import Union, Optional
 from dotenv import load_dotenv
 from pydantic_ai.models.openai import OpenAIChatModel
 
 load_dotenv()
 
 
-def get_azure_model(model_name: str = None) -> str:
+def get_azure_model(model_name: Optional[str] = None) -> str:
     """
     Get Azure OpenAI model string
     
@@ -50,7 +50,7 @@ def get_openai_model(model_name: str = "gpt-4") -> str:
     return f"openai:{model_name}"
 
 
-def get_lm_studio_model(base_url: str = None, model_name: str = "local-model") -> str:
+def get_lm_studio_model(base_url: Optional[str] = None, model_name: str = "local-model") -> str:
     """
     Get LM Studio model (OpenAI-compatible API)
     
@@ -71,7 +71,7 @@ def get_lm_studio_model(base_url: str = None, model_name: str = "local-model") -
     return f"openai:{model_name}"
 
 
-def get_model(provider: str = None, model_name: str = None, **kwargs) -> str:
+def get_model(provider: Optional[str] = None, model_name: Optional[str] = None, **kwargs) -> str:
     """
     Get model based on provider with automatic fallback
     

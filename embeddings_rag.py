@@ -1,8 +1,631 @@
 """
-LlamaIndex RAG with Persistent Vector Storage
-Handles embedding generation, storage, and retrieval using LlamaIndex.
-Supports S3 backup for embeddings persistence.
+JSON to Embeddings Processor with S3 Storage
+Processes JSON files, creates embeddings with structured metadata,
+and stores them in S3 for RAG applications.
 """
+
+import json
+import hashlib
+import tiktoken
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import logging
+from dataclasses import dataclass, asdict
+import pickle
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import for embeddings
+try:
+    from openai import OpenAI
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+    logger.warning("OpenAI not available")
+
+# Import S3 storage
+try:
+    from aws_storage import get_storage
+    HAS_S3 = True
+except ImportError:
+    get_storage = None  # type: ignore
+    HAS_S3 = False
+    logger.warning("S3 storage not available - embeddings will only be stored locally")
+
+
+@dataclass
+class EmbeddingChunk:
+    """Represents a single chunk with its embedding and metadata."""
+    chunk_id: str  # Format: {record_id}_chunk_{index}
+    record_id: str  # Unique identifier for the source JSON record
+    text: str  # The text content that was embedded
+    embedding: List[float]  # The embedding vector
+    chunk_index: int
+    total_chunks: int
+    metadata: Dict[str, Any]  # Structured metadata from JSON
+
+
+@dataclass
+class EmbeddingIndex:
+    """Container for all embeddings from a JSON file."""
+    index_name: str
+    source_file: str
+    created_at: str
+    embedding_model: str
+    num_documents: int
+    num_chunks: int
+    chunks: List[EmbeddingChunk]
+
+
+class JSONEmbeddingProcessor:
+    """
+    Process JSON files and create embeddings with structured metadata.
+    Supports chunking for long indicators and S3 storage.
+    """
+    
+    def __init__(
+        self,
+        embedding_model: str = "text-embedding-3-large",
+        max_chunk_tokens: int = 500,
+        chunk_overlap: int = 50,
+        enable_s3_sync: bool = True,
+        local_storage_dir: str = "./embeddings_storage"
+    ):
+        """
+        Initialize the embedding processor.
+        
+        Args:
+            embedding_model: OpenAI embedding model name
+            max_chunk_tokens: Maximum tokens per chunk
+            chunk_overlap: Token overlap between chunks
+            enable_s3_sync: Enable automatic S3 sync
+            local_storage_dir: Directory for local storage
+        """
+        self.embedding_model = embedding_model
+        self.max_chunk_tokens = max_chunk_tokens
+        self.chunk_overlap = chunk_overlap
+        self.enable_s3_sync = enable_s3_sync and HAS_S3
+        self.local_storage_dir = Path(local_storage_dir)
+        self.local_storage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize tokenizer
+        self.encoding = tiktoken.get_encoding("cl100k_base")
+        
+        # Initialize OpenAI client
+        if not HAS_OPENAI:
+            raise ImportError("OpenAI package required. Install with: pip install openai")
+        
+        import os
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable required")
+        
+        self.client = OpenAI(api_key=api_key)
+        
+        # Initialize S3 storage
+        self.s3_storage = None
+        if self.enable_s3_sync:
+            try:
+                if get_storage is None:
+                    raise ImportError("get_storage not available")
+                self.s3_storage = get_storage()
+                logger.info("✓ S3 sync enabled for embeddings")
+            except Exception as e:
+                logger.warning(f"S3 storage initialization failed: {e}")
+                self.enable_s3_sync = False
+    
+    def generate_record_id(self, url: str) -> str:
+        """Generate unique record ID from URL."""
+        return hashlib.md5(url.encode()).hexdigest()
+    
+    def chunk_text(self, text: str, record_id: str) -> List[Dict[str, Any]]:
+        """
+        Chunk long text into smaller pieces with overlap.
+        
+        Args:
+            text: Text to chunk
+            record_id: Unique record identifier
+            
+        Returns:
+            List of chunk dictionaries
+        """
+        tokens = self.encoding.encode(text)
+        chunks = []
+        
+        # If text fits in one chunk, don't split
+        if len(tokens) <= self.max_chunk_tokens:
+            return [{
+                "text": text,
+                "chunk_index": 0,
+                "total_chunks": 1,
+                "record_id": record_id
+            }]
+        
+        # Split into chunks with overlap
+        start = 0
+        chunk_index = 0
+        
+        while start < len(tokens):
+            end = min(start + self.max_chunk_tokens, len(tokens))
+            chunk_tokens = tokens[start:end]
+            chunk_text = self.encoding.decode(chunk_tokens)
+            
+            chunks.append({
+                "text": chunk_text,
+                "chunk_index": chunk_index,
+                "total_chunks": 0,  # Will update after
+                "record_id": record_id
+            })
+            
+            chunk_index += 1
+            start = end - self.chunk_overlap
+        
+        # Update total chunks
+        for chunk in chunks:
+            chunk["total_chunks"] = len(chunks)
+        
+        return chunks
+    
+    def create_embedding_text(self, entry: Dict[str, Any], chunk_text: Optional[str] = None) -> str:
+        """
+        Create formatted text for embedding from JSON entry.
+        
+        Args:
+            entry: JSON entry dictionary
+            chunk_text: Optional chunk of indicator text (if chunking is used)
+            
+        Returns:
+            Formatted text string for embedding
+        """
+        indicator = chunk_text if chunk_text else entry.get("Indicator", "")
+        
+        return f"""Title: {entry.get('title', '')}
+Categories: {entry.get('categories', '')}
+Technology: {entry.get('Tech', '')}
+Dimension: {entry.get('Dimension', '')}
+TRL: {entry.get('TRL', '')}
+Start-up: {entry.get('Start-up', '')}
+Date: {entry.get('publication_date', '')}
+
+Content: {indicator}"""
+    
+    def create_embedding(self, text: str) -> List[float]:
+        """
+        Generate embedding for text using OpenAI API.
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            Embedding vector
+        """
+        response = self.client.embeddings.create( # type: ignore
+            model=self.embedding_model,
+            input=text
+        )
+        return response.data[0].embedding
+    
+    def process_entry(self, entry: Dict[str, Any]) -> List[EmbeddingChunk]:
+        """
+        Process a single JSON entry and create embedding chunks.
+        
+        Args:
+            entry: JSON entry dictionary
+            
+        Returns:
+            List of EmbeddingChunk objects
+        """
+        record_id = self.generate_record_id(entry["url"])
+        indicator = entry.get("Indicator", "")
+        
+        # Chunk the indicator text
+        chunks = self.chunk_text(indicator, record_id)
+        
+        embedding_chunks = []
+        for chunk in chunks:
+            # Create embedding text
+            embedding_text = self.create_embedding_text(entry, chunk["text"])
+            
+            # Generate embedding
+            embedding_vector = self.create_embedding(embedding_text)
+            
+            # Create structured metadata
+            metadata = {
+                "record_id": record_id,
+                "url": entry.get("url", ""),
+                "title": entry.get("title", ""),
+                "publication_date": entry.get("publication_date", ""),
+                "categories": entry.get("categories", ""),
+                "dimension": entry.get("Dimension", ""),
+                "tech": entry.get("Tech", ""),
+                "trl": float(entry.get("TRL", 0.0)) if entry.get("TRL") else 0.0,
+                "startup": entry.get("Start-up", "") or entry.get("URL to start-ups", ""),
+                "chunk_index": chunk["chunk_index"],
+                "total_chunks": chunk["total_chunks"],
+                "full_indicator": indicator  # Store complete indicator
+            }
+            
+            # Create embedding chunk
+            embedding_chunk = EmbeddingChunk(
+                chunk_id=f"{record_id}_chunk_{chunk['chunk_index']}",
+                record_id=record_id,
+                text=embedding_text,
+                embedding=embedding_vector,
+                chunk_index=chunk["chunk_index"],
+                total_chunks=chunk["total_chunks"],
+                metadata=metadata
+            )
+            
+            embedding_chunks.append(embedding_chunk)
+        
+        return embedding_chunks
+    
+    def process_json_file(
+        self,
+        json_path: str,
+        progress_callback=None
+    ) -> EmbeddingIndex:
+        """
+        Process entire JSON file and create embeddings.
+        
+        Args:
+            json_path: Path to JSON file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            EmbeddingIndex object containing all embeddings
+        """
+        json_path_obj = Path(json_path)
+        index_name = json_path_obj.stem
+        
+        if progress_callback:
+            progress_callback("Loading JSON file...", 0, 100)
+        
+        # Load JSON entries
+        with open(json_path_obj, 'r', encoding='utf-8') as f:
+            entries = json.load(f)
+        
+        total = len(entries)
+        all_chunks = []
+        
+        if progress_callback:
+            progress_callback(f"Processing {total} entries...", 0, total)
+        
+        # Process each entry
+        for i, entry in enumerate(entries, 1):
+            try:
+                chunks = self.process_entry(entry)
+                all_chunks.extend(chunks)
+                
+                if progress_callback and i % 10 == 0:
+                    progress_callback(
+                        f"Processing entry {i}/{total} ({len(all_chunks)} chunks created)",
+                        i,
+                        total
+                    )
+            except Exception as e:
+                logger.error(f"Error processing entry {i}: {e}")
+                continue
+        
+        # Create embedding index
+        embedding_index = EmbeddingIndex(
+            index_name=index_name,
+            source_file=str(json_path),
+            created_at=datetime.now().isoformat(),
+            embedding_model=self.embedding_model,
+            num_documents=total,
+            num_chunks=len(all_chunks),
+            chunks=all_chunks
+        )
+        
+        if progress_callback:
+            progress_callback(
+                f"Created {len(all_chunks)} embeddings from {total} documents",
+                total,
+                total
+            )
+        
+        return embedding_index
+    
+    def save_index_locally(self, embedding_index: EmbeddingIndex) -> str:
+        """
+        Save embedding index to local storage.
+        
+        Args:
+            embedding_index: EmbeddingIndex to save
+            
+        Returns:
+            Path to saved file
+        """
+        file_path = self.local_storage_dir / f"{embedding_index.index_name}.pkl"
+        
+        with open(file_path, 'wb') as f:
+            pickle.dump(embedding_index, f)
+        
+        logger.info(f"✓ Saved embeddings locally: {file_path}")
+        return str(file_path)
+    
+    def load_index_locally(self, index_name: str) -> EmbeddingIndex:
+        """
+        Load embedding index from local storage.
+        
+        Args:
+            index_name: Name of the index
+            
+        Returns:
+            EmbeddingIndex object
+        """
+        file_path = self.local_storage_dir / f"{index_name}.pkl"
+        
+        if not file_path.exists():
+            raise FileNotFoundError(f"Index not found: {file_path}")
+        
+        with open(file_path, 'rb') as f:
+            embedding_index = pickle.load(f)
+        
+        logger.info(f"✓ Loaded embeddings from: {file_path}")
+        return embedding_index
+    
+    def upload_index_to_s3(self, embedding_index: EmbeddingIndex) -> bool:
+        """
+        Upload embedding index to S3.
+        
+        Args:
+            embedding_index: EmbeddingIndex to upload
+            
+        Returns:
+            True if successful
+        """
+        if not self.enable_s3_sync or not self.s3_storage:
+            return False
+        
+        try:
+            # First save locally
+            local_path = self.save_index_locally(embedding_index)
+            
+            # Upload to S3
+            s3_key = f"rag_embeddings/{embedding_index.index_name}.pkl"
+            success = self.s3_storage.upload_file(
+                local_path,
+                s3_key,
+                metadata={
+                    'index_name': embedding_index.index_name,
+                    'created_at': embedding_index.created_at,
+                    'num_documents': str(embedding_index.num_documents),
+                    'num_chunks': str(embedding_index.num_chunks),
+                    'embedding_model': embedding_index.embedding_model
+                }
+            )
+            
+            if success:
+                logger.info(f"✓ Uploaded embeddings to S3: {s3_key}")
+            else:
+                logger.error(f"✗ Failed to upload embeddings to S3")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error uploading to S3: {e}")
+            return False
+    
+    def download_index_from_s3(self, index_name: str) -> Optional[EmbeddingIndex]:
+        """
+        Download embedding index from S3.
+        
+        Args:
+            index_name: Name of the index
+            
+        Returns:
+            EmbeddingIndex object or None if not found
+        """
+        if not self.enable_s3_sync or not self.s3_storage:
+            return None
+        
+        try:
+            s3_key = f"rag_embeddings/{index_name}.pkl"
+            local_path = self.local_storage_dir / f"{index_name}.pkl"
+            
+            # Download from S3
+            success = self.s3_storage.download_file(s3_key, str(local_path))
+            if not success:
+                logger.error(f"Failed to download from S3: {s3_key}")
+                return None
+            
+            # Load from local file
+            return self.load_index_locally(index_name)
+            
+        except Exception as e:
+            logger.error(f"Error downloading from S3: {e}")
+            return None
+    
+    def list_s3_indexes(self) -> List[str]:
+        """
+        List all available indexes in S3.
+        
+        Returns:
+            List of index names
+        """
+        if not self.enable_s3_sync or not self.s3_storage:
+            return []
+        
+        try:
+            files = self.s3_storage.list_files(prefix="rag_embeddings/", suffix=".pkl")
+            # Extract index names from file paths
+            index_names = [Path(f).stem for f in files]
+            return index_names
+        except Exception as e:
+            logger.error(f"Error listing S3 indexes: {e}")
+            return []
+    
+    def list_local_indexes(self) -> List[str]:
+        """
+        List all available indexes in local storage.
+        
+        Returns:
+            List of index names
+        """
+        if not self.local_storage_dir.exists():
+            return []
+        
+        index_files = list(self.local_storage_dir.glob("*.pkl"))
+        return [f.stem for f in index_files]
+    
+    def query_similar(
+        self,
+        embedding_index: EmbeddingIndex,
+        query_text: str,
+        top_k: int = 5,
+        filter_metadata: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Find most similar chunks to query using cosine similarity.
+        
+        Args:
+            embedding_index: EmbeddingIndex to query
+            query_text: Query text
+            top_k: Number of top results to return
+            filter_metadata: Optional metadata filters
+            
+        Returns:
+            List of result dictionaries with scores and metadata
+        """
+        import numpy as np
+        
+        # Create embedding for query
+        query_embedding = self.create_embedding(query_text)
+        query_vector = np.array(query_embedding)
+        
+        # Calculate cosine similarity for all chunks
+        results = []
+        for chunk in embedding_index.chunks:
+            # Apply metadata filters if specified
+            if filter_metadata:
+                match = True
+                for key, value in filter_metadata.items():
+                    if chunk.metadata.get(key) != value:
+                        match = False
+                        break
+                if not match:
+                    continue
+            
+            # Calculate cosine similarity
+            chunk_vector = np.array(chunk.embedding)
+            similarity = np.dot(query_vector, chunk_vector) / (
+                np.linalg.norm(query_vector) * np.linalg.norm(chunk_vector)
+            )
+            
+            results.append({
+                'chunk_id': chunk.chunk_id,
+                'record_id': chunk.record_id,
+                'score': float(similarity),
+                'text': chunk.text,
+                'metadata': chunk.metadata
+            })
+        
+        # Sort by similarity score
+        results.sort(key=lambda x: x['score'], reverse=True)
+        
+        return results[:top_k]
+    
+    def get_full_record(
+        self,
+        embedding_index: EmbeddingIndex,
+        record_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve all chunks for a specific record.
+        
+        Args:
+            embedding_index: EmbeddingIndex to search
+            record_id: Record ID to retrieve
+            
+        Returns:
+            Dictionary with full record information
+        """
+        chunks = [c for c in embedding_index.chunks if c.record_id == record_id]
+        
+        if not chunks:
+            return None
+        
+        # Sort chunks by index
+        chunks.sort(key=lambda x: x.chunk_index)
+        
+        # Get metadata from first chunk (all chunks have same metadata)
+        metadata = chunks[0].metadata
+        
+        return {
+            'record_id': record_id,
+            'url': metadata['url'],
+            'title': metadata['title'],
+            'publication_date': metadata['publication_date'],
+            'categories': metadata['categories'],
+            'dimension': metadata['dimension'],
+            'tech': metadata['tech'],
+            'trl': metadata['trl'],
+            'startup': metadata['startup'],
+            'full_indicator': metadata['full_indicator'],
+            'total_chunks': len(chunks),
+            'chunks': [{'chunk_index': c.chunk_index, 'text': c.text} for c in chunks]
+        }
+
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize processor
+    processor = JSONEmbeddingProcessor(
+        embedding_model="text-embedding-3-large",
+        max_chunk_tokens=500,
+        chunk_overlap=50,
+        enable_s3_sync=True
+    )
+    
+    # Process JSON file
+    print("Processing JSON file...")
+    embedding_index = processor.process_json_file(
+        "path/to/your/data.json",
+        progress_callback=lambda msg, current, total: print(f"{msg} [{current}/{total}]")
+    )
+    
+    print(f"\n✓ Created {embedding_index.num_chunks} embeddings from {embedding_index.num_documents} documents")
+    
+    # Save locally
+    processor.save_index_locally(embedding_index)
+    
+    # Upload to S3
+    if processor.enable_s3_sync:
+        processor.upload_index_to_s3(embedding_index)
+    
+    # Query example
+    print("\n--- Query Example ---")
+    results = processor.query_similar(
+        embedding_index,
+        "reforestation projects in Brazil",
+        top_k=3
+    )
+    
+    for i, result in enumerate(results, 1):
+        print(f"\n{i}. Score: {result['score']:.4f}")
+        print(f"   Title: {result['metadata']['title']}")
+        print(f"   URL: {result['metadata']['url']}")
+        print(f"   Chunk: {result['metadata']['chunk_index']+1}/{result['metadata']['total_chunks']}")
+    
+    # Get full record
+    if results:
+        record_id = results[0]['record_id']
+        full_record = processor.get_full_record(embedding_index, record_id)
+        print(f"\n--- Full Record ---")
+        if full_record:
+            print(json.dumps({k: v for k, v in full_record.items() if k != 'chunks'}, indent=2))
+    
+    # List available indexes
+    print("\n--- Available Indexes ---")
+    print("Local:", processor.list_local_indexes())
+    if processor.enable_s3_sync:
+        print("S3:", processor.list_s3_indexes())
+
 
 import json
 from pathlib import Path
@@ -73,8 +696,9 @@ class LlamaIndexRAG:
         azure_api_version: str = "2024-02-15-preview",
         embedding_provider: Optional[str] = None,  # "azure" or "openai" (auto-detect from env if None)
         enable_s3_sync: bool = True,  # Enable automatic S3 sync for embeddings
-        chunk_size: int = 2048,  # Size of text chunks for embedding
-        chunk_overlap: int = 400  # Overlap between consecutive chunks
+        use_chunking: bool = False,  # Enable text chunking (default: False - one embedding per record)
+        chunk_size: int = 2048,  # Size of text chunks for embedding (only if use_chunking=True)
+        chunk_overlap: int = 400  # Overlap between consecutive chunks (only if use_chunking=True)
     ):
         """
         Initialize RAG system with LlamaIndex.
@@ -89,8 +713,9 @@ class LlamaIndexRAG:
             azure_api_version: Azure OpenAI API version
             embedding_provider: Embedding provider - "azure" or "openai" (auto-detect from EMBEDDING_PROVIDER env if None)
             enable_s3_sync: Enable automatic S3 sync for embeddings (default: True)
-            chunk_size: Size of text chunks for embedding (default: 1024 tokens)
-            chunk_overlap: Overlap between consecutive chunks (default: 200 tokens)
+            use_chunking: Enable text chunking - if False, one embedding per JSON record (default: False)
+            chunk_size: Size of text chunks for embedding (default: 2048 tokens, only if use_chunking=True)
+            chunk_overlap: Overlap between consecutive chunks (default: 400 tokens, only if use_chunking=True)
         """
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
@@ -118,6 +743,7 @@ class LlamaIndexRAG:
         self.llm_provider = llm_provider
         self.embedding_provider = embedding_provider
         self.enable_s3_sync = enable_s3_sync and HAS_S3
+        self.use_chunking = use_chunking
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         
@@ -251,12 +877,21 @@ class LlamaIndexRAG:
             self.llm_model_name = llm_model
             logger.info(f"✓ Using OpenAI LLM: {self.llm_model_name}")
         
-        # Configure text splitter for chunking
-        Settings.text_splitter = SentenceSplitter(
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap
-        )
-        logger.info(f"✓ Configured text splitter: chunk_size={self.chunk_size}, chunk_overlap={self.chunk_overlap}")
+        # Configure text splitter for chunking (only if enabled)
+        if self.use_chunking:
+            Settings.text_splitter = SentenceSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap
+            )
+            logger.info(f"✓ Text chunking enabled: chunk_size={self.chunk_size}, chunk_overlap={self.chunk_overlap}")
+        else:
+            # Disable chunking - use very large chunk size to keep documents whole
+            # This ensures one embedding per JSON record (entire document)
+            Settings.text_splitter = SentenceSplitter(
+                chunk_size=1000000,  # Very large to never split
+                chunk_overlap=0
+            )
+            logger.info("✓ Text chunking disabled - one embedding per JSON record")
         
         self.embedding_model_name = embedding_model
         self.index: Optional[VectorStoreIndex] = None

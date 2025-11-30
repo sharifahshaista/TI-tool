@@ -1,4 +1,5 @@
-""" # type: ignore
+# type: ignore # type: ignore
+"""
 Streamlit Research Agent Web Application
 
 This app provides a web interface for:
@@ -15,11 +16,21 @@ import tempfile
 import pandas as pd
 import subprocess
 import platform
+import zipfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 import logging
-from streamlit_agraph import agraph, Node, Edge, Config
 from dotenv import load_dotenv
+from openai import OpenAI
+
+# Optional: Gensim for keyword expansion
+try:
+    import gensim.downloader as api
+    HAS_GENSIM = True
+except ImportError:
+    api = None  # type: ignore
+    HAS_GENSIM = False
 
 # Load environment variables at the module level
 load_dotenv()
@@ -36,6 +47,8 @@ from schemas.datamodel import (
     CSVSummarizationMetadata,
     CSVSummarizationHistory,
 )
+from embeddings import CSVEmbeddingProcessor
+from tests.query_tests import JSONEmbeddingProcessor
 
 # Configure logging
 logging.basicConfig(
@@ -464,7 +477,7 @@ st.markdown("AI-powered tool equipped with discovery of sources, web-crawling, L
 st.sidebar.header("Navigation")
 page = st.sidebar.radio(
     "Select Mode",
-    ["Web Search", "Web Crawler", "LLM Extraction", "Summarization", "Database", "RAG", "About", "LinkedIn Home Feed Monitor"],
+    ["Web Search", "Web Crawler", "LLM Extraction", "Summarization", "Database", "Chatbot", "About", "LinkedIn Home Feed Monitor"],
     label_visibility="collapsed"
 )
 
@@ -1522,6 +1535,79 @@ elif page == "LLM Extraction":
         key="llm_output_folder"
     )
 
+    # Checkpointing configuration
+    st.subheader("💾 Checkpointing & Resume")
+    
+    # Check if checkpoint exists for selected file
+    checkpoint_info = None
+    if selected_source and selected_source.exists():
+        from agents.llm_extractor import CheckpointManager
+        checkpoint_file = Path(output_folder) / f"{selected_source.stem}_checkpoint.json"
+        
+        if checkpoint_file.exists():
+            try:
+                checkpoint_manager = CheckpointManager(checkpoint_file)
+                checkpoint_data = checkpoint_manager.checkpoint_data
+                
+                if checkpoint_data.get('processed_indices'):
+                    processed_count = len(checkpoint_data['processed_indices'])
+                    total_count = checkpoint_data.get('total_rows', 0)
+                    last_save = checkpoint_data.get('last_save_time')
+                    
+                    if last_save:
+                        from datetime import datetime
+                        try:
+                            last_save_dt = datetime.fromisoformat(last_save.replace('Z', '+00:00'))
+                            last_save_str = last_save_dt.strftime('%Y-%m-%d %H:%M:%S')
+                        except:
+                            last_save_str = last_save
+                    
+                    checkpoint_info = {
+                        'processed': processed_count,
+                        'total': total_count,
+                        'last_save': last_save_str if 'last_save_str' in locals() else last_save,
+                        'progress': processed_count / total_count * 100 if total_count > 0 else 0
+                    }
+                    
+                    st.success(f"📁 **Checkpoint Found!** {processed_count}/{total_count} rows processed ({checkpoint_info['progress']:.1f}%)")
+                    st.caption(f"Last saved: {checkpoint_info['last_save']}")
+                    
+                    # Show resume option
+                    resume_from_checkpoint = st.checkbox(
+                        "🔄 Resume from checkpoint",
+                        value=True,
+                        help=f"Continue processing from row {processed_count + 1}. Uncheck to start fresh."
+                    )
+                else:
+                    st.info("ℹ️ No valid checkpoint data found")
+                    resume_from_checkpoint = False
+            except Exception as e:
+                st.warning(f"⚠️ Could not read checkpoint: {e}")
+                resume_from_checkpoint = False
+        else:
+            st.info("ℹ️ No checkpoint found - will start fresh processing")
+            resume_from_checkpoint = False
+    
+    # Checkpoint interval setting
+    col1, col2 = st.columns(2)
+    with col1:
+        checkpoint_interval = st.number_input(
+            "Checkpoint Interval",
+            min_value=5,
+            max_value=100,
+            value=10,
+            step=5,
+            help="Save progress every N rows (recommended: 10-20)"
+        )
+    
+    with col2:
+        if checkpoint_info:
+            st.metric("Current Progress", f"{checkpoint_info['processed']}/{checkpoint_info['total']}", 
+                     f"{checkpoint_info['progress']:.1f}%")
+
+    # Interrupt handling info
+    st.info("ℹ️ **Interrupt Handling:** Processing can be safely interrupted with Ctrl+C. Progress will be automatically saved and can be resumed later.")
+
     # Start processing button
     if st.button("🤖 Start LLM Extraction", type="primary", use_container_width=True):
         if not selected_source or not selected_source.exists():
@@ -1600,7 +1686,9 @@ elif page == "LLM Extraction":
                     client=client,
                     model_name=model_name,
                     text_column="text_content",
-                    progress_callback=processing_progress_callback
+                    progress_callback=processing_progress_callback,
+                    checkpoint_interval=checkpoint_interval,
+                    resume_from_checkpoint=resume_from_checkpoint if 'resume_from_checkpoint' in locals() else True
                 ))
 
                 st.session_state.csv_processed_df = df
@@ -1775,8 +1863,6 @@ elif page == "LLM Extraction":
 elif page == "Summarization":
     st.header("Summarization")
     st.markdown("Upload CSV files with a 'content' column to generate tech-intelligence summaries and automatic categorization")
-
-    # RAG demo moved to its own page ("RAG") — open the RAG page from the sidebar to use it.
 
     # Check if processing flag is stuck (interrupted by navigation)
     if st.session_state.csv_processing and st.session_state.csv_processed_df is None:
@@ -2156,8 +2242,8 @@ elif page == "Summarization":
                         tech_fields.append(f"Dimension: {row['Dimension']}")
                     if row.get('Tech'):
                         tech_fields.append(f"Tech: {row['Tech']}")
-                    if row.get('Start-up') and str(row['Start-up']) != 'N/A':
-                        tech_fields.append(f"Start-up: {row['Start-up']}")
+                    if row.get('URL to start-ups') and str(row['URL to start-ups']) != 'N/A':
+                        tech_fields.append(f"URL to start-ups: {row['URL to start-ups']}")
                     
                     if tech_fields:
                         st.markdown(f"**Tech Intelligence:** :blue[{', '.join(tech_fields)}]")
@@ -2182,7 +2268,7 @@ elif page == "Summarization":
                         dimension = str(row.get('Dimension', ''))
                         tech = str(row.get('Tech', ''))
                         trl = str(row.get('TRL', ''))
-                        startup = str(row.get('Start-up', ''))
+                        startup = str(row.get('URL to start-ups', ''))
                         
                         tech_intel_text = f"Indicator: {indicator}\n\n"
                         if dimension:
@@ -2192,7 +2278,7 @@ elif page == "Summarization":
                         if trl:
                             tech_intel_text += f"TRL: {trl}\n"
                         if startup and startup != 'N/A':
-                            tech_intel_text += f"Start-up: {startup}\n"
+                            tech_intel_text += f"URL to start-ups: {startup}\n"
                         
                         st.text_area(
                             "Tech Intelligence",
@@ -2385,17 +2471,15 @@ elif page == "Database":
         st.markdown("""
         **Features:**
         - **Multi-file Selection**: Select multiple source files and dates to display simultaneously
-        - **Inline Editing**: Click any cell to edit its content directly in the table
         - **Row Selection**: Use checkboxes to select multiple rows to view details
-        - **Save Changes**: After editing cells, click 'Save Changes' to persist modifications
         - **Search & Filter**: Use the search box and column filters to find specific entries
-        - **Export**: Download filtered or complete database as CSV or Excel
+        - **Date Range Filter**: Filter articles by publication date
+        - **Export**: Download filtered or complete database as CSV, JSON, or Excel
         
         **Tips:**
-        - Single-click a cell to start editing
-        - Press Enter or Tab to move to the next cell
-        - All changes are saved back to the original CSV and JSON files
-        - Changes are automatically synced to S3 if configured
+        - Use the date range filter to find articles from specific time periods
+        - Combine filters for more precise results
+        - Export your filtered results in multiple formats
         """)
     
     # Import AgGrid
@@ -2475,8 +2559,16 @@ elif page == "Database":
         if all_data:
             combined_df = pd.concat(all_data, ignore_index=True)
             
-            # Merge date and pubDate columns into a single 'date' column
-            if 'pubDate' in combined_df.columns and 'date' in combined_df.columns:
+            # Merge date, pubDate, and publication_date columns into a single 'date' column
+            if 'publication_date' in combined_df.columns:
+                # Start with publication_date
+                combined_df['date'] = combined_df['publication_date']
+                # Fill in missing values from pubDate if it exists
+                if 'pubDate' in combined_df.columns:
+                    combined_df['date'] = combined_df['date'].fillna(combined_df['pubDate'])
+                    combined_df = combined_df.drop(columns=['pubDate'])
+                combined_df = combined_df.drop(columns=['publication_date'])
+            elif 'pubDate' in combined_df.columns and 'date' in combined_df.columns:
                 # Prefer pubDate, fallback to date
                 combined_df['date'] = combined_df['pubDate'].fillna(combined_df['date'])
                 combined_df = combined_df.drop(columns=['pubDate'])
@@ -2670,8 +2762,65 @@ elif page == "Database":
         else:
             selected_dates = []
     
-    # Text search
-    search_query = st.text_input("🔎 Search in database", placeholder="Enter keywords...")
+    # Publication Date Range Filter
+    if 'date' in combined_df.columns:
+        st.markdown("**📅 Publication Date Range**")
+        
+        # Parse dates for filtering (use a temporary Series, don't modify combined_df)
+        parsed_dates = pd.to_datetime(combined_df['date'], format='%d %b %Y', errors='coerce')
+        
+        # Get min and max dates (exclude NaT values)
+        valid_dates = parsed_dates.dropna()
+        if len(valid_dates) > 0:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+            
+            col_date1, col_date2 = st.columns(2)
+            with col_date1:
+                start_date = st.date_input(
+                    "From Date",
+                    value=min_date,
+                    min_value=min_date,
+                    max_value=max_date,
+                    help="Select the start date for filtering articles"
+                )
+            with col_date2:
+                end_date = st.date_input(
+                    "To Date",
+                    value=max_date,
+                    min_value=min_date,
+                    max_value=max_date,
+                    help="Select the end date for filtering articles"
+                )
+            
+            # Validate date range
+            if start_date > end_date:
+                st.warning("⚠️ Start date must be before or equal to end date")
+        else:
+            start_date = None
+            end_date = None
+            st.info("ℹ️ No valid publication dates found in the data")
+    else:
+        start_date = None
+        end_date = None
+    
+    # Text search with multiple keywords support
+    search_query = st.text_input(
+        "🔎 Search in database", 
+        placeholder="Enter keywords (separate with commas)...",
+        help="Enter one or more keywords. Separate multiple keywords with commas. Any keyword will match (OR logic). Similar keywords will be automatically found using AI if enabled below."
+    )
+    
+    # Keyword expansion option (always visible if gensim is available)
+    use_keyword_expansion = False
+    if HAS_GENSIM:
+        use_keyword_expansion = st.checkbox(
+            "🔍 Use AI to find similar keywords",
+            value=True,
+            help="Automatically expand your search with semantically similar keywords using word embeddings (powered by GloVe word2vec)"
+        )
+    else:
+        st.info("💡 Install 'gensim' package to enable AI-powered keyword expansion")
     
     # Apply filters
     filtered_df = combined_df.copy()
@@ -2690,17 +2839,119 @@ elif page == "Database":
         # If nothing selected, show nothing
         filtered_df = filtered_df.iloc[0:0]
     
+    # Filter by publication date range
+    if 'date' in combined_df.columns and start_date and end_date:
+        # Parse dates from the filtered dataframe for comparison
+        filtered_parsed_dates = pd.to_datetime(filtered_df['date'], format='%d %b %Y', errors='coerce')
+        
+        # Convert start_date and end_date to datetime for comparison
+        start_datetime = pd.to_datetime(start_date)
+        end_datetime = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)  # Include entire end date
+        
+        # Filter rows where parsed date is within range
+        date_mask = (filtered_parsed_dates >= start_datetime) & (filtered_parsed_dates <= end_datetime)
+        filtered_df = filtered_df[date_mask]
+    
     # Determine which columns will be displayed (exclude hidden columns)
     exclude_cols = ['source_file', 'processed_date', 'content', 'file', 'file_location', 
                    'filename', 'file_name', 'folder', 'filepath', 'Source', 'source', 'author']
     display_columns = [col for col in filtered_df.columns if col not in exclude_cols]
     
+    # Load word2vec model for keyword expansion (cached)
+    @st.cache_resource
+    def load_word2vec_model():
+        """Load pre-trained word2vec model (cached)"""
+        if not HAS_GENSIM or api is None:
+            return None
+            
+        try:
+            # Use a smaller model for faster loading - glove-wiki-gigaword-50
+            # Alternative: 'word2vec-google-news-300' (larger, more accurate but slower)
+            model = api.load('glove-wiki-gigaword-50')
+            return model
+        except Exception as e:
+            st.warning(f"Could not load word2vec model: {e}")
+            return None
+    
+    def expand_keywords(keywords, model, top_n=10):
+        """Find similar keywords using word2vec"""
+        expanded = {}
+        for keyword in keywords:
+            # Clean the keyword (lowercase, replace spaces with underscores for multi-word)
+            clean_key = keyword.lower().replace(' ', '_')
+            similar_words = []
+            
+            try:
+                if clean_key in model:
+                    # Get most similar words
+                    similar = model.most_similar(clean_key, topn=top_n)
+                    similar_words = [word for word, score in similar if score > 0.7]  # Only high similarity
+            except:
+                # If keyword not in vocabulary, try individual words
+                words = keyword.lower().split()
+                for word in words:
+                    try:
+                        if word in model:
+                            similar = model.most_similar(word, topn=5)
+                            similar_words.extend([w for w, s in similar if s > 0.6])
+                    except:
+                        pass
+            
+            if similar_words:
+                expanded[keyword] = list(set(similar_words[:top_n]))  # Deduplicate and limit
+        
+        return expanded
+    
+    # Multi-keyword search (OR logic with optional expansion)
     if search_query:
-        # Search only across columns that will be displayed to the user
-        mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
-        for col in display_columns:
-            mask |= filtered_df[col].astype(str).str.contains(search_query, case=False, na=False)
-        filtered_df = filtered_df[mask]
+        # Parse multiple keywords - split by comma only
+        keywords = [k.strip() for k in search_query.split(',') if k.strip()]
+        
+        if not keywords:
+            keywords = [search_query.strip()]
+        
+        # Expand keywords if enabled
+        all_keywords = keywords.copy()
+        expanded_keywords_dict = {}
+        
+        if use_keyword_expansion and HAS_GENSIM:
+            with st.spinner("🤖 Finding similar keywords..."):
+                model = load_word2vec_model()
+                if model is not None:
+                    expanded_keywords_dict = expand_keywords(keywords, model, top_n=5)
+                    
+                    # Add expanded keywords to search
+                    for original, similar in expanded_keywords_dict.items():
+                        all_keywords.extend(similar)
+                    
+                    # Remove duplicates while preserving order
+                    seen = set()
+                    all_keywords = [k for k in all_keywords if k.lower() not in seen and not seen.add(k.lower())]
+        
+        # Apply OR logic - any keyword may match
+        final_mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
+
+        for keyword in all_keywords:
+            # Create a mask for this keyword across all display columns
+            keyword_mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
+            for col in display_columns:
+                keyword_mask |= filtered_df[col].astype(str).str.contains(keyword, case=False, na=False, regex=False)
+            # OR with the final mask (any keyword matches)
+            final_mask |= keyword_mask
+
+        filtered_df = filtered_df[final_mask]
+
+        # Show which keywords are being searched
+        if expanded_keywords_dict:
+            st.success("✨ **Expanded Keywords:**")
+            for original, similar in expanded_keywords_dict.items():
+                if similar:
+                    st.caption(f"  • **{original}** → {', '.join(similar)}")
+        
+        if len(keywords) > 1:
+            st.caption(f"🔍 Searching for any of: {', '.join([f'**{k}**' for k in all_keywords])} (any match)")
+        else:
+            st.caption(f"🔍 Searching for: **{', '.join([f'**{k}**' for k in all_keywords])}**")
     
     st.info(f"Showing {len(filtered_df)} of {len(combined_df)} entries")
     
@@ -2716,6 +2967,17 @@ elif page == "Database":
         exclude_cols = ['source_file', 'processed_date', 'content', 'file', 'file_location', 
                        'filename', 'file_name', 'folder', 'filepath', 'Source', 'source', 'author', 'categories']
         display_df = filtered_df.drop(columns=[col for col in exclude_cols if col in filtered_df.columns])
+        
+        # Reorder columns to put 'date' as the third column
+        if 'date' in display_df.columns:
+            # Get all columns
+            cols = display_df.columns.tolist()
+            # Remove 'date' from its current position
+            cols.remove('date')
+            # Insert 'date' at position 2 (third column, 0-indexed)
+            cols.insert(2, 'date')
+            # Reorder the dataframe
+            display_df = display_df[cols]
         
         # Reset index to show row numbers starting from 1
         display_df = display_df.reset_index(drop=True)
@@ -2767,7 +3029,7 @@ elif page == "Database":
             wrapText=True,
             autoHeight=True,
             enableCellTextSelection=True,
-            editable=True  # Enable editing for all columns by default
+            editable=False  # Disable editing for all columns
         )
         # Configure specific columns
         if 'url' in display_df.columns:
@@ -2779,7 +3041,7 @@ elif page == "Database":
                 autoHeight=True,
                 cellStyle={'word-break': 'break-all', 'white-space': 'normal'},
                 enableCellTextSelection=True,
-                editable=True
+                editable=False
             )
         
         if 'Indicator' in display_df.columns:
@@ -2789,7 +3051,7 @@ elif page == "Database":
                 width=150, 
                 wrapText=True, 
                 enableCellTextSelection=True,
-                editable=True
+                editable=False
             )
         
         if 'title' in display_df.columns:
@@ -2799,7 +3061,7 @@ elif page == "Database":
                 width=100, 
                 wrapText=True, 
                 enableCellTextSelection=True,
-                editable=True
+                editable=False
             )
         
         if 'date' in display_df.columns:
@@ -2808,143 +3070,41 @@ elif page == "Database":
                 headerName='Date', 
                 width=100, 
                 enableCellTextSelection=True,
-                editable=True
+                editable=False
             )
         
         # Configure selection
         gb.configure_selection(selection_mode='multiple', use_checkbox=True)
         
-        # Enable text selection and editing
+        # Enable text selection (read-only mode)
         gb.configure_grid_options(
             enableCellTextSelection=True, 
             ensureDomOrder=True,
-            suppressRowClickSelection=True,  # Prevent row selection on cell click (for editing)
-            singleClickEdit=True  # Enable single click to edit
+            suppressRowClickSelection=False  # Allow row selection on click
         )
         
         gridOptions = gb.build()
         
-        # Add custom CSS for URL wrapping
+        # Configure default column options (read-only)
         gridOptions['defaultColDef']['wrapText'] = True
         gridOptions['defaultColDef']['autoHeight'] = True
         gridOptions['defaultColDef']['enableCellTextSelection'] = True
-        gridOptions['defaultColDef']['editable'] = True
+        gridOptions['defaultColDef']['editable'] = False
         
         # Display AgGrid
         grid_response = AgGrid(
             display_df,
             gridOptions=gridOptions,
             data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            update_mode=GridUpdateMode.VALUE_CHANGED,  # Changed to capture value changes
+            update_mode=GridUpdateMode.NO_UPDATE,  # Read-only mode
             fit_columns_on_grid_load=False,
-            theme='streamlit',  # can be 'streamlit' or 'streamlit-dark'
+            theme='streamlit',
             width=800,
             height=800,
             allow_unsafe_jscode=True,
             enable_enterprise_modules=False,
-            reload_data=False  # Don't reload data on every interaction
+            reload_data=False
         )
-        
-        # Get edited data
-        edited_df = pd.DataFrame(grid_response['data'])
-        
-        # Check if data was modified
-        data_modified = False
-        if not display_df.equals(edited_df):
-            data_modified = True
-            st.info("⚠️ Data has been modified. Click 'Save Changes' to persist changes to files.")
-        
-        # Save changes button
-        if data_modified:
-            col_save1, col_save2, col_save3 = st.columns([1, 1, 2])
-            with col_save1:
-                if st.button("💾 Save Changes", type="primary", use_container_width=True):
-                    try:
-                        # Map edited data back to original dataframe using URL as key
-                        if 'url' not in edited_df.columns:
-                            st.error("Cannot save: URL column is required for tracking changes")
-                        else:
-                            files_modified = set()
-                            rows_updated = 0
-                            
-                            # Restore the excluded columns to edited_df from filtered_df
-                            # First, create a mapping from display index back to filtered_df
-                            edited_df_with_metadata = edited_df.copy()
-                            
-                            # For each CSV file, update matching rows
-                            for csv_file in csv_files:
-                                try:
-                                    df = pd.read_csv(csv_file)
-                                    original_len = len(df)
-                                    file_modified = False
-                                    
-                                    if 'url' not in df.columns:
-                                        continue
-                                    
-                                    # Update rows that match URLs in edited data
-                                    for idx, edited_row in edited_df.iterrows():
-                                        url = edited_row.get('url')
-                                        if pd.isna(url):
-                                            continue
-                                        
-                                        # Find matching row in CSV
-                                        mask = df['url'] == url
-                                        if mask.any():
-                                            # Update columns that exist in both dataframes
-                                            for col in edited_df.columns:
-                                                if col in df.columns:
-                                                    df.loc[mask, col] = edited_row[col]
-                                            
-                                            file_modified = True
-                                            rows_updated += mask.sum()
-                                    
-                                    if file_modified:
-                                        # Save modified CSV
-                                        df.to_csv(csv_file, index=False)
-                                        files_modified.add(csv_file.name)
-                                        
-                                        # Also update JSON if it exists
-                                        json_file = csv_file.with_suffix('.json')
-                                        if json_file.exists():
-                                            try:
-                                                df.to_json(json_file, orient='records', indent=2)
-                                            except Exception as e:
-                                                st.warning(f"Could not update {json_file.name}: {e}")
-                                
-                                except Exception as e:
-                                    st.warning(f"Error processing {csv_file.name}: {e}")
-                            
-                            # Upload modified files to S3
-                            if files_modified:
-                                try:
-                                    from aws_storage import get_storage
-                                    s3_storage = get_storage()
-                                    
-                                    for file_name in files_modified:
-                                        csv_path = summarised_dir / file_name
-                                        s3_key = f"summarised_content/{file_name}"
-                                        s3_storage.upload_file(str(csv_path), s3_key)
-                                        
-                                        # Also upload JSON if it exists
-                                        json_name = file_name.replace('.csv', '.json')
-                                        json_path = summarised_dir / json_name
-                                        if json_path.exists():
-                                            s3_json_key = f"summarised_content/{json_name}"
-                                            s3_storage.upload_file(str(json_path), s3_json_key)
-                                except Exception as e:
-                                    st.warning(f"⚠️ Could not sync to S3: {e}")
-                            
-                            # Clear cache and refresh
-                            load_all_csvs.clear()
-                            st.success(f"✅ Successfully saved changes to {rows_updated} row(s) across {len(files_modified)} file(s)")
-                            st.rerun()
-                    
-                    except Exception as e:
-                        st.error(f"Error saving changes: {e}")
-            
-            with col_save2:
-                if st.button("🔄 Discard Changes", use_container_width=True):
-                    st.rerun()
         
         # Show selection info if any rows are selected
         selected_rows = grid_response['selected_rows']
@@ -2958,14 +3118,16 @@ elif page == "Database":
     # Export options
     st.subheader("📥 Export Database")
     
-    col1, col2, col3 = st.columns(3)
+    # CSV & JSON exports
+    st.markdown("**CSV & JSON Formats**")
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        # Export filtered results
+        # Export filtered results as CSV
         if len(filtered_df) > 0:
             csv_export = filtered_df.to_csv(index=False).encode('utf-8')
             st.download_button(
-                label="Download Filtered Results",
+                label="📄 Filtered CSV",
                 data=csv_export,
                 file_name=f"filtered_database_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
@@ -2973,818 +3135,813 @@ elif page == "Database":
             )
     
     with col2:
-        # Export all data
+        # Export filtered results as JSON
+        if len(filtered_df) > 0:
+            # Convert DataFrame to JSON (orient='records' creates array of objects)
+            json_export = filtered_df.to_json(orient='records', indent=2, force_ascii=False).encode('utf-8')
+            st.download_button(
+                label="📋 Filtered JSON",
+                data=json_export,
+                file_name=f"filtered_database_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+    
+    with col3:
+        # Export all data as CSV
         all_csv = combined_df.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="Download Complete Database",
+            label="📄 Complete CSV",
             data=all_csv,
             file_name=f"complete_database_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv",
             use_container_width=True
         )
     
-    with col3:
-        # Export to Excel (if openpyxl is installed)
-        try:
-            from io import BytesIO
-            output = BytesIO()
-            
-            # Prepare dataframes for export
-            export_all_df = combined_df.copy()
-            if 'categories' in export_all_df.columns:
-                export_all_df['categories'] = export_all_df['categories'].apply(
-                    lambda x: '; '.join(x) if isinstance(x, list) else x
-                )
-            
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                export_all_df.to_excel(writer, index=False, sheet_name='All Data')
-                if len(filtered_df) > 0 and len(filtered_df) < len(combined_df):
-                    export_filtered_df = filtered_df.copy()
-                    if 'categories' in export_filtered_df.columns:
-                        export_filtered_df['categories'] = export_filtered_df['categories'].apply(
-                            lambda x: '; '.join(x) if isinstance(x, list) else x
-                        )
-                    export_filtered_df.to_excel(writer, index=False, sheet_name='Filtered')
-            
-            st.download_button(
-                label="Download as Excel",
-                data=output.getvalue(),
-                file_name=f"database_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+    with col4:
+        # Export all data as JSON
+        all_json = combined_df.to_json(orient='records', indent=2, force_ascii=False).encode('utf-8')
+        st.download_button(
+            label="📋 Complete JSON",
+            data=all_json,
+            file_name=f"complete_database_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    
+    # Excel export (separate row)
+    st.markdown("**Excel Format**")
+    col_excel = st.columns(1)[0]
+    
+    # Export to Excel (if openpyxl is installed)
+    try:
+        from io import BytesIO
+        output = BytesIO()
+        
+        # Prepare dataframes for export
+        export_all_df = combined_df.copy()
+        if 'categories' in export_all_df.columns:
+            export_all_df['categories'] = export_all_df['categories'].apply(
+                lambda x: '; '.join(x) if isinstance(x, list) else x
             )
-        except ImportError:
-            st.caption("Install openpyxl for Excel export")
+        
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            export_all_df.to_excel(writer, index=False, sheet_name='All Data')
+            if len(filtered_df) > 0 and len(filtered_df) < len(combined_df):
+                export_filtered_df = filtered_df.copy()
+                if 'categories' in export_filtered_df.columns:
+                    export_filtered_df['categories'] = export_filtered_df['categories'].apply(
+                        lambda x: '; '.join(x) if isinstance(x, list) else x
+                    )
+                export_filtered_df.to_excel(writer, index=False, sheet_name='Filtered')
+        
+        st.download_button(
+            label="📊 Download as Excel (All Sheets)",
+            data=output.getvalue(),
+            file_name=f"database_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    except ImportError:
+        st.caption("Install openpyxl for Excel export")
 
-# RAG Page - Chat Interface with Citations
-elif page == "RAG":
-    st.caption("Ask questions about your documents. Responses include [Document N] citations.")
+
+elif page == "Chatbot":
+    st.header("🤖 AI Research Assistant")
+    st.markdown("Chat with your technology intelligence database using AI-powered keyword search and metadata filtering")
     
-    # Initialize RAG-specific session state
-    if "rag_messages" not in st.session_state:
-        st.session_state.rag_messages = []
-    if "rag_show_sources" not in st.session_state:
-        st.session_state.rag_show_sources = True
-    if "rag_show_scores" not in st.session_state:
-        st.session_state.rag_show_scores = True
-    if "rag_top_k" not in st.session_state:
-        st.session_state.rag_top_k = 3
-    if "rag_index_built" not in st.session_state:
-        st.session_state.rag_index_built = False
-    if "rag_llm_provider" not in st.session_state:
-        st.session_state.rag_llm_provider = "azure_openai"  # Default to Azure OpenAI
-    if "rag_lm_studio_url" not in st.session_state:
-        st.session_state.rag_lm_studio_url = "http://127.0.0.1:1234/v1"
-    if "rag_chunk_size" not in st.session_state:
-        st.session_state.rag_chunk_size = 1024
-    if "rag_chunk_overlap" not in st.session_state:
-        st.session_state.rag_chunk_overlap = 200
-    if "rag_system" not in st.session_state:
-        from embeddings_rag import LlamaIndexRAG
-        import os
-        from dotenv import load_dotenv
-        load_dotenv()
-        
-        # Build parameters based on provider
-        rag_params = {
-            "persist_dir": "rag_storage",
-            "llm_provider": st.session_state.rag_llm_provider,
-            "chunk_size": st.session_state.rag_chunk_size,
-            "chunk_overlap": st.session_state.rag_chunk_overlap
-        }
-        
-        if st.session_state.rag_llm_provider == "azure_openai":
-            azure_deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-            embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
-            if azure_deployment:
-                rag_params["azure_deployment"] = azure_deployment
-            rag_params["embedding_model"] = embedding_deployment
-        elif st.session_state.rag_llm_provider == "lm_studio":
-            rag_params["lm_studio_base_url"] = st.session_state.rag_lm_studio_url
-        
-        st.session_state.rag_system = LlamaIndexRAG(**rag_params)
+    # Initialize session state for chat
+    if 'chat_messages' not in st.session_state:
+        st.session_state.chat_messages = []
+    if 'chat_processor' not in st.session_state:
+        st.session_state.chat_processor = None
+    if 'embedding_indexes' not in st.session_state:
+        st.session_state.embedding_indexes = {}
+    if 'embeddings_built' not in st.session_state:
+        st.session_state.embeddings_built = False
     
-    rag_system = st.session_state.rag_system
+    # Check for available data
+    summarised_dir = Path("summarised_content")
+    json_files = list(summarised_dir.glob("*.json")) if summarised_dir.exists() else []
     
-    # Sidebar configuration
+    # Filter out history.json
+    json_files = [f for f in json_files if f.name != "history.json"]
+    
+    if not json_files:
+        st.warning("⚠️ No JSON files found in `summarised_content/` folder. Please process some files in the Summarization page first.")
+        st.info("💡 The chatbot needs processed JSON data to answer your questions.")
+        st.stop()
+    
+    # File selection for embeddings
+    st.markdown("#### 📁 Select Data Sources")
+    
+    # Helper function for source name extraction
+    def extract_source_name_from_filename(filename: str) -> str:
+        """
+        Extract and format source name from filename.
+        Uses same logic as JSONEmbeddingProcessor.extract_source_name()
+        
+        Args:
+            filename: Filename like "techcrunch_com_20251127.json"
+            
+        Returns:
+            Formatted source name like "Techcrunch"
+        """
+        from pathlib import Path
+        
+        # Remove .json extension and split by underscores
+        stem = Path(filename).stem
+        parts = stem.split('_')
+        
+        # Take first part and capitalize it
+        if parts:
+            source = parts[0].replace('com', '').replace('org', '').replace('net', '')
+            # Capitalize first letter
+            return source.capitalize()
+        
+        return stem
+    
+    # Get available JSON files with metadata
+    available_files = []
+    for json_file in json_files:
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if data:  # Check if file has content
+                    # Extract source name from filename using same logic as JSONEmbeddingProcessor
+                    filename = json_file.name
+                    source_name = extract_source_name_from_filename(filename)
+                    
+                    available_files.append({
+                        'filename': filename,
+                        'source_name': source_name,
+                        'path': json_file,
+                        'count': len(data)
+                    })
+        except Exception as e:
+            st.warning(f"⚠️ Could not read {json_file.name}: {e}")
+    
+    if not available_files:
+        st.error("No valid JSON files found with content.")
+        st.stop()
+    
+    # Create options for multiselect
+    file_options = [f"{f['source_name']} ({f['count']} articles)" for f in available_files]
+    file_options_dict = {f"{f['source_name']} ({f['count']} articles)": f for f in available_files}
+    
+    # Default to all files if none selected, or filter out invalid cached selections
+    if 'selected_files' not in st.session_state:
+        st.session_state.selected_files = file_options
+    else:
+        # Filter out any cached selections that are no longer valid (e.g., history.json was removed)
+        st.session_state.selected_files = [opt for opt in st.session_state.selected_files if opt in file_options]
+        # If all selections were invalid, default to all files
+        if not st.session_state.selected_files:
+            st.session_state.selected_files = file_options
+    
+    selected_options = st.multiselect(
+        "Choose which data sources to include:",
+        options=file_options,
+        default=st.session_state.selected_files,
+        help="Select the JSON files you want to use for the chatbot. Only selected sources will be included in searches."
+    )
+    
+    # Update session state
+    st.session_state.selected_files = selected_options
+    
+    # Get selected file objects
+    selected_files = [file_options_dict[opt] for opt in selected_options] if selected_options else []
+    
+    if not selected_files:
+        st.warning("Please select at least one data source.")
+        st.stop()
+    
+    # Helper functions for S3 embeddings management
+    def upload_embeddings_to_s3(processor, embedding_indexes):
+        """Upload all embedding indexes to S3"""
+        success_count = 0
+        for source_name, embedding_index in embedding_indexes.items():
+            try:
+                if processor.upload_index_to_s3(embedding_index):
+                    success_count += 1
+            except Exception as e:
+                st.error(f"Failed to upload {source_name}: {e}")
+        return success_count
+    
+    def download_embeddings_from_s3(processor):
+        """Download all embedding indexes from S3"""
+        try:
+            s3_indexes = processor.list_s3_indexes()
+            embedding_indexes = {}
+            
+            for index_name in s3_indexes:
+                try:
+                    embedding_index = processor.download_index_from_s3(index_name)
+                    if embedding_index:
+                        # Extract source name from index name
+                        source_name = index_name.replace('_embeddings', '')
+                        embedding_indexes[source_name] = embedding_index
+                except Exception as e:
+                    st.warning(f"Failed to download {index_name}: {e}")
+                    continue
+            
+            return embedding_indexes
+        except Exception as e:
+            st.error(f"Failed to download from S3: {e}")
+            return {}
+    
+    # Sidebar controls
     with st.sidebar:
-        st.header("⚙️ RAG Configuration")
+        st.markdown("### 🗄️ Database Status")
         
-        # LLM Provider Selection
-        st.subheader("🤖 LLM Provider")
+        # Check if embeddings exist in S3 for selected files
+        s3_available_indexes = []
+        try:
+            from aws_storage import get_storage
+            s3_storage = get_storage()
+            s3_files = s3_storage.list_files(prefix="rag_embeddings/", suffix=".pkl")
+            s3_available_indexes = [f.replace("rag_embeddings/", "").replace("_embeddings.pkl", "") for f in s3_files]
+        except:
+            pass
         
-        llm_provider = st.selectbox(
-            "Select LLM for Response Generation",
-            options=["azure_openai", "openai", "lm_studio"],
-            format_func=lambda x: "Azure OpenAI" if x == "azure_openai" else ("OpenAI" if x == "openai" else "LM Studio (Local)"),
-            index=0 if st.session_state.rag_llm_provider == "azure_openai" else (1 if st.session_state.rag_llm_provider == "openai" else 2),
-            help="Choose which LLM to use. Azure OpenAI is used for both embeddings and generation."
-        )
+        if s3_available_indexes:
+            available_selected = [f for f in selected_files if f['source_name'] in s3_available_indexes]
+            if available_selected:
+                st.success(f"☁️ {len(available_selected)}/{len(selected_files)} selected sources available in S3")
         
-        # Show Azure OpenAI config if selected
-        if llm_provider == "azure_openai":
-            # Use AZURE_OPENAI_CHAT_DEPLOYMENT_NAME first, then fallback to AZURE_OPENAI_DEPLOYMENT_NAME
-            default_deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o-mini")
-            azure_deployment = st.text_input(
-                "Azure Deployment Name",
-                value=default_deployment,
-                help="Azure OpenAI deployment name (LLM)"
-            )
+        if st.session_state.embeddings_built:
+            st.success(f"✅ Data indexed")
             
-            # Check Azure OpenAI configuration
-            if os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"):
-                st.success(f"✅ Azure OpenAI configured - Deployment: `{azure_deployment}`")
-            else:
-                st.error("❌ Azure OpenAI not configured. Set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT in .env")
-        
-        # Show LM Studio URL input if selected
-        elif llm_provider == "lm_studio":
-            azure_deployment = None
-            lm_studio_url = st.text_input(
-                "LM Studio Base URL",
-                value=st.session_state.rag_lm_studio_url,
-                help="URL where LM Studio is running"
-            )
-            
-            # Try to get loaded model info
-            try:
-                import requests
-                models_url = lm_studio_url.replace("/v1", "") + "/v1/models"
-                response = requests.get(models_url, timeout=2)
-                if response.status_code == 200:
-                    models_data = response.json()
-                    if models_data.get("data") and len(models_data["data"]) > 0:
-                        loaded_model = models_data["data"][0].get("id", "Unknown")
-                        st.success(f"✅ Connected - Model: `{loaded_model}`")
-                    else:
-                        st.warning("⚠️ No model loaded in LM Studio")
-                else:
-                    st.warning(f"⚠️ Could not connect (Status: {response.status_code})")
-            except requests.exceptions.RequestException:
-                st.error("❌ Cannot connect to LM Studio. Make sure it's running.")
-            except Exception:
-                st.info("💡 Make sure LM Studio is running with a model loaded")
+            # Show document count for loaded sources
+            if st.session_state.embedding_indexes:
+                loaded_sources = list(st.session_state.embedding_indexes.keys())
+                total_docs = sum(idx.num_documents for idx in st.session_state.embedding_indexes.values())
+                total_chunks = sum(idx.num_chunks for idx in st.session_state.embedding_indexes.values())
+                st.metric("Loaded Sources", len(loaded_sources))
+                st.metric("Documents", total_docs)
+                st.metric("Chunks", total_chunks)
+                
+                # Show which sources are loaded
+                with st.expander("📋 Loaded Sources", expanded=False):
+                    for source in loaded_sources:
+                        st.write(f"• {source}")
         else:
-            # OpenAI
-            azure_deployment = None
-            lm_studio_url = st.session_state.rag_lm_studio_url
-            if os.getenv("OPENAI_API_KEY"):
-                st.success("✅ OpenAI API key configured")
-            else:
-                st.error("❌ OpenAI API key not found in .env")
-        
-        # Update RAG system if provider changed
-        if llm_provider != st.session_state.rag_llm_provider or (llm_provider == "lm_studio" and lm_studio_url != st.session_state.rag_lm_studio_url):
-            if st.button("🔄 Apply LLM Settings", type="primary", use_container_width=True):
-                st.session_state.rag_llm_provider = llm_provider
-                if llm_provider == "lm_studio":
-                    st.session_state.rag_lm_studio_url = lm_studio_url
-                
-                # Reinitialize RAG system with new settings
-                from embeddings_rag import LlamaIndexRAG
-                
-                embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
-                
-                if llm_provider == "azure_openai":
-                    st.session_state.rag_system = LlamaIndexRAG(
-                        persist_dir="rag_storage",
-                        llm_provider=llm_provider,
-                        azure_deployment=azure_deployment,
-                        embedding_model=embedding_deployment,
-                        chunk_size=st.session_state.rag_chunk_size,
-                        chunk_overlap=st.session_state.rag_chunk_overlap
-                    )
-                elif llm_provider == "lm_studio":
-                    st.session_state.rag_system = LlamaIndexRAG(
-                        persist_dir="rag_storage",
-                        llm_provider=llm_provider,
-                        lm_studio_base_url=lm_studio_url,
-                        embedding_model=embedding_deployment,
-                        chunk_size=st.session_state.rag_chunk_size,
-                        chunk_overlap=st.session_state.rag_chunk_overlap
-                    )
-                else:  # openai
-                    st.session_state.rag_system = LlamaIndexRAG(
-                        persist_dir="rag_storage",
-                        llm_provider=llm_provider,
-                        embedding_model=embedding_deployment,
-                        chunk_size=st.session_state.rag_chunk_size,
-                        chunk_overlap=st.session_state.rag_chunk_overlap
-                    )
-                
-                # Show which provider is being used for embeddings
-                embedding_provider = os.getenv("EMBEDDING_PROVIDER", llm_provider)
-                st.success(f"✓ Switched to {llm_provider.upper()} for response generation")
-                st.info(f"ℹ️ Embeddings use {embedding_provider.upper()}")
-                st.rerun()
-        
-        st.caption("💡 **Note:** Embeddings use Azure OpenAI (text-embedding-3-large)")
-        
-        # Show current configuration
-        config_status = "🤖 **Current Setup:**\n"
-        config_status += f"- Embeddings: Azure OpenAI ({os.getenv('AZURE_OPENAI_EMBEDDING_DEPLOYMENT', 'text-embedding-3-large')})\n"
-        config_status += f"- LLM Generation: {st.session_state.rag_llm_provider.upper()}"
-        if st.session_state.rag_llm_provider == "lm_studio":
-            config_status += f"\n- LM Studio URL: {st.session_state.rag_lm_studio_url}"
-        st.info(config_status)
+            st.info(f"📂 Selected {len(selected_files)} source(s)")
         
         st.divider()
         
-        # Chunk size configuration
-        st.subheader("📝 Text Chunking")
-        
-        if "rag_chunk_size" not in st.session_state:
-            st.session_state.rag_chunk_size = 2048
-        if "rag_chunk_overlap" not in st.session_state:
-            st.session_state.rag_chunk_overlap = 400
-        
-        chunk_size = st.number_input(
-            "Chunk Size (tokens)",
-            min_value=256,
-            max_value=4096,
-            value=st.session_state.rag_chunk_size,
-            step=128,
-            help="Size of text chunks for embedding. Smaller chunks = more precise but more embeddings. Larger chunks = more context but less precise."
-        )
-        
-        chunk_overlap = st.number_input(
-            "Chunk Overlap (tokens)",
-            min_value=0,
-            max_value=512,
-            value=st.session_state.rag_chunk_overlap,
-            step=50,
-            help="Overlap between consecutive chunks. Helps maintain context across chunk boundaries."
-        )
-        
-        # Apply chunk size changes
-        if chunk_size != st.session_state.rag_chunk_size or chunk_overlap != st.session_state.rag_chunk_overlap:
-            if st.button("🔄 Apply Chunking Settings", type="secondary", use_container_width=True):
-                st.session_state.rag_chunk_size = chunk_size
-                st.session_state.rag_chunk_overlap = chunk_overlap
-                
-                # Reinitialize RAG system with new chunk settings
-                from embeddings_rag import LlamaIndexRAG
-                
-                embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
-                
-                rag_params = {
-                    "persist_dir": "rag_storage",
-                    "llm_provider": st.session_state.rag_llm_provider,
-                    "chunk_size": chunk_size,
-                    "chunk_overlap": chunk_overlap
-                }
-                
-                if st.session_state.rag_llm_provider == "azure_openai":
-                    rag_params["azure_deployment"] = azure_deployment
-                    rag_params["embedding_model"] = embedding_deployment
-                elif st.session_state.rag_llm_provider == "lm_studio":
-                    rag_params["lm_studio_base_url"] = st.session_state.rag_lm_studio_url
-                    rag_params["embedding_model"] = embedding_deployment
-                else:  # openai
-                    rag_params["embedding_model"] = embedding_deployment
-                
-                st.session_state.rag_system = LlamaIndexRAG(**rag_params)
-                
-                st.success(f"✓ Updated chunking: {chunk_size} tokens with {chunk_overlap} overlap")
-                st.warning("⚠️ Note: Existing indexes won't be affected. Rebuild indexes to use new chunk settings.")
-                st.rerun()
-        
-        st.caption(f"Current: {st.session_state.rag_chunk_size} tokens, {st.session_state.rag_chunk_overlap} overlap")
-        
-        st.divider()
-        
-        # Add reload button
-        if st.button("🔄 Reload RAG System", help="Click if you updated the RAG code", use_container_width=True):
-            # Force reload of the RAG system
-            from importlib import reload
-            import embeddings_rag
-            reload(embeddings_rag)
-            from embeddings_rag import LlamaIndexRAG
-            
-            embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
-            
-            # Build parameters based on provider
-            rag_params = {
-                "persist_dir": "rag_storage",
-                "llm_provider": st.session_state.rag_llm_provider,
-                "embedding_model": embedding_deployment,
-                "chunk_size": st.session_state.rag_chunk_size,
-                "chunk_overlap": st.session_state.rag_chunk_overlap
-            }
-            
-            if st.session_state.rag_llm_provider == "azure_openai":
-                # Get Azure deployment from environment (prioritize AZURE_OPENAI_CHAT_DEPLOYMENT_NAME)
-                import os
-                from dotenv import load_dotenv
-                load_dotenv()
-                azure_deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-                if azure_deployment:
-                    rag_params["azure_deployment"] = azure_deployment
-            elif st.session_state.rag_llm_provider == "lm_studio":
-                rag_params["lm_studio_base_url"] = st.session_state.rag_lm_studio_url
-            
-            st.session_state.rag_system = LlamaIndexRAG(**rag_params)
-            st.success("✓ RAG system reloaded!")
-            st.rerun()
-        
-        st.divider()
-        
-        # Show available persisted indexes
-        available_indexes = rag_system.get_available_indexes()
-        
-        # If no local indexes found, try to retrieve from S3
-        if not available_indexes:
-            try:
-                from aws_storage import get_storage
-                s3_storage = get_storage()
-                
-                with st.spinner("📥 Checking S3 for RAG indexes..."):
-                    # List all ZIP files in S3 rag_embeddings prefix
-                    s3_zip_files = s3_storage.list_files(prefix="rag_embeddings/", suffix=".zip")
-                    
-                    if s3_zip_files:
-                        st.info(f"Found {len(s3_zip_files)} index(es) in S3. Downloading and extracting...")
-                        
-                        import zipfile
-                        rag_storage_dir = Path(rag_system.persist_dir)
-                        rag_storage_dir.mkdir(parents=True, exist_ok=True)
-                        
-                        # Download and extract each ZIP file
-                        for s3_key in s3_zip_files:
-                            file_name = s3_key.split('/')[-1]
-                            index_name = file_name.replace('.zip', '')
-                            
-                            # Download to temp location
-                            temp_zip = rag_storage_dir / file_name
-                            
-                            if s3_storage.download_file(s3_key, str(temp_zip)):
-                                # Extract ZIP file
-                                try:
-                                    with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
-                                        zip_ref.extractall(rag_storage_dir)
-                                    st.success(f"✓ Downloaded and extracted: {index_name}")
-                                    # Remove the ZIP file after extraction
-                                    temp_zip.unlink()
-                                except Exception as e:
-                                    st.warning(f"⚠️ Failed to extract {file_name}: {str(e)}")
-                            else:
-                                st.warning(f"⚠️ Failed to download: {file_name}")
-                        
-                        # Refresh available indexes
-                        available_indexes = rag_system.get_available_indexes()
-                        
-                        if available_indexes:
-                            st.success(f"✅ Successfully retrieved {len(available_indexes)} index(es) from S3")
-                    else:
-                        st.info("No index files found in S3 rag_embeddings folder")
-            except Exception as e:
-                st.warning(f"⚠️ Could not retrieve from S3: {str(e)}")
-        
-        if available_indexes:
-            st.success(f"💾 Found {len(available_indexes)} persisted index(es)")
-            
-            # Multi-select for loading indexes
-            st.subheader("� Active Indexes")
-            
-            # Initialize selected indexes in session state
-            if "rag_selected_indexes" not in st.session_state:
-                st.session_state.rag_selected_indexes = []
-            
-            index_names = [idx['index_name'] for idx in available_indexes]
-            
-            selected_indexes = st.multiselect(
-                "Select indexes to query",
-                options=index_names,
-                default=st.session_state.rag_selected_indexes,
-                help="Choose one or more indexes to search across",
-                key="rag_multiselect"
-            )
-            
-            if st.button("🔄 Load Selected", use_container_width=True, disabled=not selected_indexes):
-                with st.spinner(f"Loading {len(selected_indexes)} index(es)..."):
+        # Load from S3 button for selected files
+        available_in_s3 = [f for f in selected_files if f['source_name'] in s3_available_indexes]
+        if available_in_s3:
+            if st.button("☁️ Load Selected from S3", use_container_width=True, type="secondary"):
+                with st.spinner("Downloading selected embeddings from S3..."):
                     try:
-                        results = rag_system.load_multiple_indexes(selected_indexes)
-                        total_docs = sum(v for v in results.values() if isinstance(v, int))
-                        st.session_state.rag_selected_indexes = selected_indexes
-                        st.session_state.rag_index_built = True
-                        st.success(f"✓ Loaded {len(selected_indexes)} index(es) with {total_docs} total docs!")
-                        st.rerun()
+                        from tests.query_tests import JSONEmbeddingProcessor
+                        processor = JSONEmbeddingProcessor()
+                        
+                        embedding_indexes = {}
+                        loaded_count = 0
+                        
+                        for file_info in selected_files:
+                            source_key = file_info['source_name']
+                            if source_key in s3_available_indexes:
+                                try:
+                                    embedding_index = processor.download_index_from_s3(f"{source_key}_embeddings")
+                                    if embedding_index:
+                                        embedding_indexes[file_info['source_name']] = embedding_index
+                                        loaded_count += 1
+                                except Exception as e:
+                                    st.warning(f"Failed to download {file_info['source_name']}: {e}")
+                        
+                        if embedding_indexes:
+                            st.session_state.chat_processor = processor
+                            st.session_state.embedding_indexes = embedding_indexes
+                            st.session_state.embeddings_built = True
+                            total_docs = sum(idx.num_documents for idx in embedding_indexes.values())
+                            total_chunks = sum(idx.num_chunks for idx in embedding_indexes.values())
+                            st.success(f"✅ Loaded {loaded_count}/{len(selected_files)} sources from S3! {total_docs} documents ({total_chunks} chunks)")
+                            st.rerun()
+                        else:
+                            st.error("Failed to load any embeddings from S3")
                     except Exception as e:
-                        st.error(f"Error: {e}")
-            
-            # Show details of available indexes
-            with st.expander("📦 Index Details", expanded=False):
-                for idx_meta in available_indexes:
-                    is_selected = idx_meta['index_name'] in st.session_state.rag_selected_indexes
-                    status_icon = "✅" if is_selected else "⬜"
-                    st.caption(f"{status_icon} **{idx_meta['index_name']}**")
-                    st.caption(f"📄 {idx_meta['num_documents']} docs • 🕐 {idx_meta['created_at'][:10]}")
-                    st.divider()
+                        st.error(f"Error loading from S3: {e}")
         
-        # Index building section
-        st.subheader("📊 Build New Index")
-        
-        # Get list of JSON files in summarised_content folder
-        summarised_dir = Path("summarised_content")
-        summarised_dir.mkdir(parents=True, exist_ok=True)
-        json_files = []
-        if summarised_dir.exists():
-            json_files = sorted([f.name for f in summarised_dir.glob("*.json") if f.name != "history.json"])
-        
-        # If local folder is empty, try to retrieve from S3
-        if not json_files:
-            try:
-                from aws_storage import get_storage
-                s3_storage = get_storage()
-                
-                with st.spinner("📥 Checking S3 for summarized JSON files..."):
-                    # List all JSON files in S3 summarised_content prefix
-                    s3_json_files = s3_storage.list_files(prefix="summarised_content/", suffix=".json")
+        # Build/Rebuild embeddings for selected files
+        if st.button("🔄 Build Selected Embeddings", use_container_width=True, type="primary"):
+            with st.spinner("Building embeddings for selected files..."):
+                try:
+                    from tests.query_tests import JSONEmbeddingProcessor
                     
-                    if s3_json_files:
-                        st.info(f"Found {len(s3_json_files)} JSON file(s) in S3. Downloading...")
-                        
-                        # Download each file
-                        for s3_key in s3_json_files:
-                            file_name = s3_key.split('/')[-1]
-                            # Skip history.json
-                            if file_name == "history.json":
-                                continue
-                            
-                            local_path = summarised_dir / file_name
-                            
-                            if s3_storage.download_file(s3_key, str(local_path)):
-                                json_files.append(file_name)
-                                st.success(f"✓ Downloaded: {file_name}")
-                            else:
-                                st.warning(f"⚠️ Failed to download: {file_name}")
-                        
-                        if json_files:
-                            json_files = sorted(json_files)
-                            st.success(f"✅ Successfully retrieved {len(json_files)} JSON file(s) from S3")
-                    else:
-                        st.info("No JSON files found in S3 summarised_content folder")
-            except Exception as e:
-                st.warning(f"⚠️ Could not retrieve from S3: {str(e)}")
-        
-        if json_files:
-            # Dropdown for selecting JSON file
-            selected_file = st.selectbox(
-                "Select JSON file",
-                options=json_files,
-                help="Choose a summarized JSON file from the folder",
-                key="rag_selected_file"
-            )
-            data_source = str(summarised_dir / selected_file)
-            st.caption(f"📁 Path: `{data_source}`")
-            
-            # Check if index already exists
-            index_name = Path(selected_file).stem
-            index_exists = (rag_system.persist_dir / index_name).exists()
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                build_button_label = "🔄 Rebuild" if index_exists else "🔨 Build"
-                if st.button(build_button_label, use_container_width=True):
-                    with st.spinner("Building index..."):
+                    # Initialize processor with same parameters as rebuild_embeddings.py
+                    processor = JSONEmbeddingProcessor(
+                        enable_s3_sync=True,
+                        local_storage_dir="./embeddings_storage"
+                    )
+                    
+                    embedding_indexes = {}
+                    
+                    for file_info in selected_files:
                         try:
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
+                            st.info(f"Processing {file_info['filename']}...")
                             
-                            def progress_callback(message, current, total):
-                                if total > 0:
-                                    progress_bar.progress(min(current / total, 1.0))
-                                status_text.text(message)
-                            
-                            num_docs = rag_system.build_index_from_json(
-                                data_source,
-                                force_rebuild=True,
-                                progress_callback=progress_callback
+                            # Process the entire JSON file using the processor
+                            embedding_index = processor.process_json_file(
+                                file_info['path'],
+                                progress_callback=lambda msg, current, total: st.info(f"{msg} [{current}/{total}]")
                             )
                             
-                            st.session_state.rag_index_built = True
-                            progress_bar.empty()
-                            status_text.empty()
-                            st.success(f"✓ Built & saved {num_docs} docs!")
-                            st.rerun()
+                            st.info(f"✓ Created embedding index: {embedding_index.num_documents} docs, {embedding_index.num_chunks} chunks")
+                            
+                            # Save locally
+                            local_path = processor.save_index_locally(embedding_index)
+                            st.info(f"✓ Saved locally: {local_path}")
+                            
+                            # Upload to S3
+                            if processor.upload_index_to_s3(embedding_index):
+                                st.info(f"✓ Uploaded to S3")
+                            else:
+                                st.warning(f"⚠️ S3 upload failed for {file_info['filename']}")
+                            
+                            # Store in session state
+                            embedding_indexes[file_info['source_name']] = embedding_index
                             
                         except Exception as e:
-                            st.error(f"Build failed: {e}")
-            
-            with col2:
-                if index_exists:
-                    if st.button("📂 Load", use_container_width=True):
-                        with st.spinner("Loading..."):
-                            try:
-                                num_docs = rag_system.load_index(index_name)
-                                st.session_state.rag_index_built = True
-                                st.success(f"✓ Loaded {num_docs} docs!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Load failed: {e}")
-        else:
-            # Fallback to text input if no files found
-            st.warning("No JSON files found in summarised_content folder")
-            data_source = st.text_input(
-                "Enter JSON file path manually",
-                value="summarised_content/thinkgeoenergy_20251028.json",
-                help="Path to your summarized JSON file",
-                key="rag_data_source"
-            )
-            
-            if st.button("🔨 Build Index", use_container_width=True):
-                with st.spinner("Building index..."):
-                    try:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        def progress_callback(message, current, total):
-                            if total > 0:
-                                progress_bar.progress(min(current / total, 1.0))
-                            status_text.text(message)
-                        
-                        # Show initial info
-                        status_text.info("⏳ Initializing... This may take a few minutes depending on the number of documents.")
-                        
-                        num_docs = rag_system.build_index_from_json(
-                            data_source,
-                            force_rebuild=True,
-                            progress_callback=progress_callback
-                        )
-                        
-                        st.session_state.rag_index_built = True
-                        progress_bar.empty()
-                        status_text.empty()
-                        st.success(f"✓ Built & saved {num_docs} docs!")
-                        st.rerun()
-                        
-                    except Exception as e:
-                        progress_bar.empty()
-                        status_text.empty()
-                        st.error(f"Build failed: {e}")
-                        st.exception(e)  # Show full traceback
+                            st.warning(f"Error processing {file_info['filename']}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            continue
+                    
+                    if not embedding_indexes:
+                        st.error("❌ No embeddings were built successfully")
+                        st.stop()
+                    
+                    # Store in session state
+                    st.session_state.chat_processor = processor
+                    st.session_state.embedding_indexes = embedding_indexes
+                    st.session_state.embeddings_built = True
+                    
+                    total_docs = sum(idx.num_documents for idx in embedding_indexes.values())
+                    total_chunks = sum(idx.num_chunks for idx in embedding_indexes.values())
+                    
+                    st.success(f"✅ Embeddings built successfully! {total_docs} documents processed into {total_chunks} chunks across {len(embedding_indexes)} sources.")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"Error building embeddings: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    st.stop()
         
-        # Index status
-        if st.session_state.rag_index_built and st.session_state.rag_selected_indexes:
-            st.success(f"✓ {len(st.session_state.rag_selected_indexes)} index(es) loaded")
-            st.caption(f"Active: {', '.join(st.session_state.rag_selected_indexes)}")
-        elif st.session_state.rag_index_built:
-            st.success("✓ Index is ready")
-        else:
-            st.warning("⚠️ Please build or load index(es) first")
+        if st.session_state.embeddings_built:
+            st.caption("💡 Rebuild if you've added new data")
         
         st.divider()
         
-        # Retrieval settings
-        st.subheader("🔍 Retrieval Settings")
-        st.session_state.rag_top_k = st.slider(
-            "Top-K documents",
-            min_value=1,
-            max_value=10,
-            value=st.session_state.rag_top_k,
-            help="Number of documents to retrieve for each query"
-        )
-        
-        st.divider()
-        
-        # Display options
-        st.subheader("👁️ Display Options")
-        st.session_state.rag_show_sources = st.checkbox(
-            "Show retrieved sources",
-            value=st.session_state.rag_show_sources,
-            help="Display metadata of retrieved documents"
-        )
-        st.session_state.rag_show_scores = st.checkbox(
-            "Show similarity scores",
-            value=st.session_state.rag_show_scores,
-            help="Display cosine similarity scores"
-        )
-        
-        st.divider()
-        
-        # Statistics
-        st.subheader("📈 Statistics")
-        st.metric("Total Messages", len(st.session_state.rag_messages))
-        st.metric("User Queries", len([m for m in st.session_state.rag_messages if m["role"] == "user"]))
-        
-        st.divider()
-        
-        # Clear chat button
+        # Clear chat history
         if st.button("🗑️ Clear Chat History", use_container_width=True):
-            st.session_state.rag_messages = []
+            st.session_state.chat_messages = []
             st.rerun()
-        
-        st.divider()
-        
-        # Information
-        st.info("""
-        **RAG Pipeline:**
-        
-        1. **Index** - Build embeddings using LlamaIndex
-        2. **Retrieve** - Find relevant docs via vector similarity
-        3. **Generate** - LLM answers with [Document N] citations
-        
-        💾 **Persistent Storage:** Indexes saved to `rag_storage/` - load instantly without rebuilding!
-        
-        📚 Citations reference the sources shown below each response.
-        """)
     
-    # Display chat history
-    for message in st.session_state.rag_messages:
+    # Main chat interface
+    if not st.session_state.embeddings_built:
+        st.info("👆 Click **Load from S3** or **Build/Rebuild Embeddings** in the sidebar to start chatting")
+        st.stop()
+    
+    # Load processor if not in session state
+    if st.session_state.chat_processor is None or not st.session_state.embedding_indexes:
+        try:
+            processor = JSONEmbeddingProcessor()
+            # Load all indexes from local storage
+            local_indexes = processor.list_local_indexes()
+            embedding_indexes = {}
+            for index_name in local_indexes:
+                try:
+                    embedding_index = processor.load_index_locally(index_name)
+                    source_name = index_name.replace('_embeddings', '')
+                    embedding_indexes[source_name] = embedding_index
+                except Exception as e:
+                    st.warning(f"Failed to load local index {index_name}: {e}")
+            
+            if embedding_indexes:
+                st.session_state.chat_processor = processor
+                st.session_state.embedding_indexes = embedding_indexes
+            else:
+                st.error("No embedding indexes found. Please build embeddings first.")
+                st.stop()
+        except Exception as e:
+            st.error(f"Error loading data: {e}")
+            st.stop()
+    
+    # Display chat messages
+    for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             
-            # Display sources metadata only
-            if message["role"] == "assistant" and "sources" in message:
-                if st.session_state.rag_show_sources and message["sources"]:
-                    with st.expander("📚 Retrieved Sources", expanded=False):
-                        for idx, doc in enumerate(message["sources"], 1):
-                            md = doc['metadata']
-                            score = doc['score']
-                            
-                            # Extract website name from source_index or use document number
-                            if 'source_index' in md:
-                                website_name = md['source_index'].rsplit('_', 1)[0]
-                                header = f"[{website_name}] - Document {idx}"
-                            else:
-                                header = f"Document {idx}"
-                            
-                            st.markdown(f"### {header}")
-                            if st.session_state.rag_show_scores:
-                                st.markdown(f"**Score:** {score:.4f}")
-                            
-                            # Display metadata fields
-                            metadata_display = []
-                            for key in ['title', 'filename', 'date', 'dimension', 'tech', 'trl', 'startup', 'url', 'indicator']:
-                                value = md.get(key)
-                                if value not in [None, '', 'N/A']:
-                                    if key == 'url':
-                                        metadata_display.append(f"**{key.title()}:** [{value}]({value})")
-                                    else:
-                                        metadata_display.append(f"**{key.title()}:** {value}")
-                            
-                            if metadata_display:
-                                st.markdown("\n\n".join(metadata_display))
-                            else:
-                                st.caption("(No metadata available)")
-                            
-                            if idx < len(message["sources"]):
-                                st.divider()
+            # Show sources if available
+            if "sources" in message and message["sources"]:
+                with st.expander("📚 Sources"):
+                    for i, source in enumerate(message["sources"], 1):
+                        st.markdown(f"**{i}. [{source['title']}]({source['url']})**")
+                        st.caption(f"📅 {source.get('publication_date', 'N/A')} | 🏷️ {source.get('categories', 'N/A')}")
+                        if source.get('source'):
+                            st.caption(f"📺 Source: {source['source']}")
+                        if source.get('tech'):
+                            st.caption(f"💡 Tech: {source['tech']} | TRL: {source.get('trl', 'N/A')} | Dim: {source.get('dimension', 'N/A')}")
+                        st.divider()
     
     # Chat input
-    if prompt := st.chat_input("Ask a question about your documents..."):
-        # Check if index is built
-        if not st.session_state.rag_index_built:
-            st.error("⚠️ Please build or load an index first using the sidebar.")
-            st.stop()
-        
-        # Add user message to chat history
-        st.session_state.rag_messages.append({
-            "role": "user",
-            "content": prompt,
-            "timestamp": datetime.now().isoformat()
-        })
+    if prompt := st.chat_input("Ask about technology intelligence... (try: 'latest AI articles', 'TechCrunch hydrogen news', 'TRL 8 technologies')"):
+        # Add user message to chat
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
         
         # Display user message
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Generate assistant response
+        # Generate response
         with st.chat_message("assistant"):
-            try:
-                # Query using LlamaIndex
-                with st.status("🔍 Retrieving relevant documents...", expanded=True) as status:
-                    st.write("Searching knowledge base...")
+            with st.spinner("Searching knowledge base..."):
+                try:
+                    processor = st.session_state.chat_processor
                     
-                    # Detect query intent (if method exists)
-                    if hasattr(rag_system, '_detect_query_intent'):
-                        intent = rag_system._detect_query_intent(prompt)
-                        if intent['sort_by_date']:
-                            st.write("🗓️ Detected temporal query - sorting by date (most recent first)")
-                    
-                    # Check if multiple indexes are selected
-                    if st.session_state.rag_selected_indexes and len(st.session_state.rag_selected_indexes) > 1:
-                        # Multi-index query
-                        st.write(f"Querying {len(st.session_state.rag_selected_indexes)} indexes...")
-                        result = rag_system.query_multiple_indexes(
-                            query=prompt,
-                            index_names=st.session_state.rag_selected_indexes,
-                            top_k=st.session_state.rag_top_k
-                        )
+                    # Parse query for field-based filtering
+                    def parse_query_for_filters(query):
+                        """Parse natural language query to extract metadata filters and date ranges"""
+                        filters = {}
+                        date_filters = {}
+                        query_lower = query.lower()
                         
-                        response = result['response']
-                        retrieved_docs = [{
-                            'metadata': node.metadata,
-                            'score': node.score,
-                            'text': node.text
-                        } for node in result['source_nodes']]
+                        # Import datetime for date parsing
+                        from datetime import datetime, timedelta
+                        import re
                         
-                        st.write(f"✓ Searched across: {', '.join(result['indexes_queried'])}")
-                    else:
-                        # Single index query
-                        result = rag_system.query(
-                            query_text=prompt,
-                            top_k=st.session_state.rag_top_k
-                        )
+                        # Source filters (e.g., "from TechCrunch", "TechCrunch articles")
+                        sources = ["techcrunch", "carbonherald", "hydrogen-central", "interestingengineering", "canarymedia", "bioenergy-news", "pv-magazine"]
+                        for source in sources:
+                            if source in query_lower or f"from {source}" in query_lower:
+                                filters["source"] = source.replace("-", "").replace("_", "")
+                                break
                         
-                        response = result['response']
-                        retrieved_docs = result['retrieved_docs']
+                        # Dimension filters
+                        dimensions = ["energy", "environment", "technology", "climate", "sustainability", "renewable", "carbon", "hydrogen", "solar", "wind"]
+                        for dim in dimensions:
+                            if dim in query_lower:
+                                filters["dimension"] = dim
+                                break
+                        
+                        # Tech filters
+                        tech_terms = ["ai", "artificial intelligence", "machine learning", "blockchain", "iot", "robotics", "biotech", "nanotech"]
+                        for tech in tech_terms:
+                            if tech in query_lower:
+                                filters["tech"] = tech
+                                break
+                        
+                        # TRL filters (Technology Readiness Level)
+                        if "trl" in query_lower:
+                            for i in range(1, 10):
+                                if f"trl {i}" in query_lower or f"trl{i}" in query_lower:
+                                    filters["trl"] = str(i)
+                                    break
+                        
+                        # Enhanced date parsing
+                        current_year = datetime.now().year
+                        current_month = datetime.now().month
+                        
+                        # Specific month/year patterns (e.g., "Nov 2025", "November 2025", "in 2025")
+                        month_patterns = {
+                            r'(january|jan)\s+(\d{4})': 1,
+                            r'(february|feb)\s+(\d{4})': 2,
+                            r'(march|mar)\s+(\d{4})': 3,
+                            r'(april|apr)\s+(\d{4})': 4,
+                            r'(may)\s+(\d{4})': 5,
+                            r'(june|jun)\s+(\d{4})': 6,
+                            r'(july|jul)\s+(\d{4})': 7,
+                            r'(august|aug)\s+(\d{4})': 8,
+                            r'(september|sept|sep)\s+(\d{4})': 9,
+                            r'(october|oct)\s+(\d{4})': 10,
+                            r'(november|nov)\s+(\d{4})': 11,
+                            r'(december|dec)\s+(\d{4})': 12
+                        }
+                        
+                        for pattern, month_num in month_patterns.items():
+                            match = re.search(pattern, query_lower)
+                            if match:
+                                year = int(match.group(2))
+                                # Date range for that month
+                                date_filters['year'] = year
+                                date_filters['month'] = month_num
+                                date_filters['date_after'] = f"{year}-{month_num:02d}-01"
+                                # Calculate last day of month
+                                if month_num == 12:
+                                    next_month = 1
+                                    next_year = year + 1
+                                else:
+                                    next_month = month_num + 1
+                                    next_year = year
+                                date_filters['date_before'] = f"{next_year}-{next_month:02d}-01"
+                                break
+                        
+                        # Year only patterns (e.g., "in 2025", "from 2025")
+                        if not date_filters:
+                            year_match = re.search(r'\b(in|from|during)\s+(\d{4})\b', query_lower)
+                            if year_match:
+                                year = int(year_match.group(2))
+                                date_filters['year'] = year
+                                date_filters['date_after'] = f"{year}-01-01"
+                                date_filters['date_before'] = f"{year + 1}-01-01"
+                        
+                        # Relative date filters
+                        if not date_filters:
+                            if "latest" in query_lower or "recent" in query_lower or "new" in query_lower:
+                                # Get recent articles (last 2 months / 60 days)
+                                two_months_ago = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+                                date_filters['date_after'] = two_months_ago
+                            elif "this month" in query_lower:
+                                date_filters['date_after'] = f"{current_year}-{current_month:02d}-01"
+                            elif "last month" in query_lower:
+                                last_month = current_month - 1 if current_month > 1 else 12
+                                last_year = current_year if current_month > 1 else current_year - 1
+                                date_filters['date_after'] = f"{last_year}-{last_month:02d}-01"
+                                date_filters['date_before'] = f"{current_year}-{current_month:02d}-01"
+                        
+                        return filters, date_filters
                     
-                    st.write(f"✓ Found {len(retrieved_docs)} relevant documents")
-                    st.write("💬 Generated response with citations")
+                    # Parse query for metadata filters
+                    metadata_filters, date_filters = parse_query_for_filters(prompt)
                     
-                    status.update(label="✓ Complete!", state="complete", expanded=False)
-                
-                # Display response
-                st.markdown(response)
-                
-                # Display sources metadata
-                if st.session_state.rag_show_sources and retrieved_docs:
-                    with st.expander("📚 Retrieved Sources", expanded=False):
-                        for idx, doc in enumerate(retrieved_docs, 1):
-                            md = doc['metadata']
-                            score = doc['score']
+                    # Show debug info about detected filters
+                    if metadata_filters or date_filters:
+                        filter_info = []
+                        if metadata_filters:
+                            filter_info.append(f"**Metadata filters:** {', '.join([f'{k}={v}' for k, v in metadata_filters.items()])}")
+                        if date_filters:
+                            if 'year' in date_filters and 'month' in date_filters:
+                                month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                                filter_info.append(f"**Date filter:** {month_names[date_filters['month']]} {date_filters['year']}")
+                            elif 'year' in date_filters:
+                                filter_info.append(f"**Date filter:** Year {date_filters['year']}")
+                            elif 'date_after' in date_filters:
+                                filter_info.append(f"**Date filter:** After {date_filters['date_after']}")
+                        
+                        st.info("🔍 " + " | ".join(filter_info))
+                    
+                    # Query across all embedding indexes
+                    all_results = []
+                    processor = st.session_state.chat_processor
+                    embedding_indexes = st.session_state.embedding_indexes
+                    
+                    # Get more results initially if we need to filter by date
+                    initial_top_k = 20 if date_filters else 5
+                    
+                    for source_name, embedding_index in embedding_indexes.items():
+                        try:
+                            results = processor.query_similar(
+                                embedding_index,
+                                query_text=prompt,
+                                top_k=initial_top_k,
+                                filter_metadata=metadata_filters if metadata_filters else None
+                            )
                             
-                            # Extract website name from source_index or use document number
-                            if 'source_index' in md:
-                                website_name = md['source_index'].rsplit('_', 1)[0]
-                                header = f"[{website_name}] - Document {idx}"
-                            else:
-                                header = f"Document {idx}"
+                            # Add source information to results
+                            for result in results:
+                                result['metadata']['source'] = source_name
                             
-                            st.markdown(f"### {header}")
-                            if st.session_state.rag_show_scores:
-                                st.markdown(f"**Score:** {score:.4f}")
+                            all_results.extend(results)
+                        except Exception as e:
+                            st.warning(f"Error querying {source_name}: {e}")
+                            continue
+                    
+                    # Apply date filtering on results if specified
+                    if date_filters and all_results:
+                        from datetime import datetime
+                        
+                        filtered_results = []
+                        for result in all_results:
+                            pub_date = result['metadata'].get('publication_date', '')
+                            if not pub_date:
+                                continue
                             
-                            # Display metadata fields in the requested order
-                            # Order: URL, Publication Date, Title, Indicator, Dimension, Tech, TRL, Start-up
-                            metadata_display = []
+                            try:
+                                # Parse publication date (handle various formats)
+                                if 'T' in pub_date:
+                                    pub_date_obj = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+                                else:
+                                    pub_date_obj = datetime.strptime(pub_date[:10], '%Y-%m-%d')
+                                
+                                # Check date filters
+                                if 'date_after' in date_filters:
+                                    after_date = datetime.strptime(date_filters['date_after'], '%Y-%m-%d')
+                                    if pub_date_obj < after_date:
+                                        continue
+                                
+                                if 'date_before' in date_filters:
+                                    before_date = datetime.strptime(date_filters['date_before'], '%Y-%m-%d')
+                                    if pub_date_obj >= before_date:
+                                        continue
+                                
+                                filtered_results.append(result)
+                                
+                            except (ValueError, AttributeError) as e:
+                                # Skip results with invalid dates
+                                continue
+                        
+                        all_results = filtered_results
+                    
+                    # Sort all results by score and take top 5
+                    all_results.sort(key=lambda x: x['score'], reverse=True)
+                    results = all_results[:5]
+                    
+                    # Extract relevant information
+                    sources = []
+                    context_texts = []
+                    
+                    if results:
+                        for result in results:
+                            metadata = result['metadata']
                             
-                            # URL (required field - always show first)
-                            url_value = md.get('url') or md.get('URL')
-                            if url_value and url_value not in [None, '', 'N/A']:
-                                metadata_display.append(f"**URL:** [{url_value}]({url_value})")
+                            # Add to sources with ALL available fields
+                            sources.append({
+                                "url": metadata.get("url", ""),
+                                "title": metadata.get("title", "Untitled"),
+                                "publication_date": metadata.get("publication_date", ""),
+                                "categories": metadata.get("categories", ""),
+                                "indicator": metadata.get("full_indicator", ""),
+                                "dimension": metadata.get("dimension", ""),
+                                "tech": metadata.get("tech", ""),
+                                "trl": metadata.get("trl", ""),
+                                "startup": metadata.get("startup", ""),
+                                "source": metadata.get("source", "")
+                            })
                             
-                            # Publication Date
-                            pub_date = md.get('publication_date') or md.get('date') or md.get('Publication Date')
-                            if pub_date and pub_date not in [None, '', 'N/A']:
-                                metadata_display.append(f"**Publication Date:** {pub_date}")
-                            
-                            # Title
-                            title_value = md.get('title') or md.get('Title')
-                            if title_value and title_value not in [None, '', 'N/A']:
-                                metadata_display.append(f"**Title:** {title_value}")
-                            
-                            # Indicator
-                            indicator_value = md.get('Indicator') or md.get('indicator')
-                            if indicator_value and indicator_value not in [None, '', 'N/A']:
-                                # Truncate long indicators for readability
-                                if len(indicator_value) > 300:
-                                    indicator_value = indicator_value[:300] + "..."
-                                metadata_display.append(f"**Indicator:** {indicator_value}")
-                            
-                            # Dimension
-                            dimension_value = md.get('Dimension') or md.get('dimension')
-                            if dimension_value and dimension_value not in [None, '', 'N/A']:
-                                metadata_display.append(f"**Dimension:** {dimension_value}")
-                            
-                            # Tech
-                            tech_value = md.get('Tech') or md.get('tech')
-                            if tech_value and tech_value not in [None, '', 'N/A']:
-                                metadata_display.append(f"**Tech:** {tech_value}")
-                            
-                            # TRL (Technology Readiness Level)
-                            trl_value = md.get('TRL') or md.get('trl')
-                            if trl_value and trl_value not in [None, '', 'N/A']:
-                                metadata_display.append(f"**TRL:** {trl_value}")
-                            
-                            # Start-up
-                            startup_value = md.get('Start-up') or md.get('startup') or md.get('Startup')
-                            if startup_value and startup_value not in [None, '', 'N/A']:
-                                metadata_display.append(f"**Start-up:** {startup_value}")
-                            
-                            if metadata_display:
-                                st.markdown("\n\n".join(metadata_display))
-                            else:
-                                st.caption("(No metadata available)")
-                            
-                            if idx < len(retrieved_docs):
-                                st.divider()
-                
-                # Add assistant message to chat history
-                st.session_state.rag_messages.append({
-                    "role": "assistant",
-                    "content": response,
-                    "sources": retrieved_docs,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-            except Exception as e:
-                st.error(f"Error generating response: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+                            # Add to context (use the chunk text)
+                            context_texts.append(result['text'])
+                    
+                    # Generate response using OpenAI
+                    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url="https://api.openai.com/v1")
+                    
+                    # Create system prompt with context
+                    current_date = datetime.now().strftime("%Y-%m-%d")
+                    
+                    # Add date filter info to help LLM understand the query context
+                    date_context = ""
+                    if date_filters:
+                        if 'year' in date_filters and 'month' in date_filters:
+                            month_names = ["", "January", "February", "March", "April", "May", "June", 
+                                         "July", "August", "September", "October", "November", "December"]
+                            month_name = month_names[date_filters['month']]
+                            date_context = f"\n\nIMPORTANT: The user is asking specifically about articles from {month_name} {date_filters['year']}. Only consider the provided sources which have been filtered to this date range."
+                        elif 'year' in date_filters:
+                            date_context = f"\n\nIMPORTANT: The user is asking specifically about articles from {date_filters['year']}. Only consider the provided sources which have been filtered to this date range."
+                        elif 'date_after' in date_filters:
+                            date_context = f"\n\nIMPORTANT: The user is asking about recent/latest articles. Only consider the provided sources which have been filtered to recent publications."
+                    
+                    system_prompt = f"""You are an AI research assistant specialized in technology intelligence and innovation analysis. 
+You have access to a knowledge base of articles about emerging technologies, startups, carbon markets, and clean energy from various sources.
 
-## About Page
+Today is {current_date}.{date_context}
+
+Use the provided context to answer questions accurately and comprehensively. 
+When answering analytical questions (e.g., "what technologies are mentioned most", "trending topics", "most discussed"):
+1. COUNT and ANALYZE the information from the provided sources
+2. Look for PATTERNS and FREQUENCIES in the data
+3. Provide SPECIFIC NUMBERS and STATISTICS when possible
+4. List technologies/topics in order of frequency or importance
+5. Always verify dates from the source metadata to ensure accuracy
+
+If the context doesn't contain relevant information, say so clearly.
+
+CRITICAL: You MUST accurately cite all your outputs with your sources using markdown hyperlink format when referencing information. 
+Each source has a title and URL. Use the format: [Source Title](URL)
+For example: 'According to [TechCrunch Article](https://techcrunch.com/article), the technology...'
+Always include source citations with hyperlinks when referencing specific information from the context.
+
+The knowledge base includes articles from sources like TechCrunch, Carbon Herald, Hydrogen Central, etc., with metadata about:
+- Technology areas (AI, renewable energy, carbon tech, etc.)
+- Technology Readiness Levels (TRL 1-9)
+- Dimensions (energy, environment, technology, climate, etc.)
+- Publication dates and sources"""
+                    
+                    # Create context from search results
+                    context = "\n\n---\n\n".join(context_texts) if context_texts else "No relevant information found in the knowledge base."
+                    
+                    # Create source information for citations
+                    source_info = []
+                    metadata_summary = []
+                    for i, src in enumerate(sources, 1):
+                        title = src.get('title', f'Source {i}')
+                        url = src.get('url', '')
+                        pub_date = src.get('publication_date', 'Unknown date')
+                        tech = src.get('tech', 'N/A')
+                        dimension = src.get('dimension', 'N/A')
+                        
+                        # Format publication date
+                        if pub_date and pub_date != 'Unknown date':
+                            try:
+                                if 'T' in pub_date:
+                                    date_obj = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+                                else:
+                                    date_obj = datetime.strptime(pub_date[:10], '%Y-%m-%d')
+                                pub_date = date_obj.strftime('%B %d, %Y')
+                            except:
+                                pass
+                        
+                        if url:
+                            source_info.append(f"Source {i}: [{title}]({url})")
+                            metadata_summary.append(f"Source {i}: Published {pub_date}, Tech: {tech}, Dimension: {dimension}")
+                        else:
+                            source_info.append(f"Source {i}: {title}")
+                            metadata_summary.append(f"Source {i}: Published {pub_date}, Tech: {tech}, Dimension: {dimension}")
+                    
+                    sources_text = "\n".join(source_info)
+                    metadata_text = "\n".join(metadata_summary)
+                    
+                    user_prompt = f"""Context information is below.
+---------------------
+{context}
+---------------------
+Available sources for citation:
+{sources_text}
+
+Source Metadata (for analysis):
+{metadata_text}
+
+Given the context information and not prior knowledge, answer the question. 
+You MUST accurately cite all your outputs with your sources using markdown hyperlink format: [Source Title](URL). 
+Each source has a title and URL that you should use for citations.
+For example: 'According to [TechCrunch Article](https://techcrunch.com/article), the technology...'
+Always include source citations with hyperlinks when referencing information.
+
+For analytical questions about trends, frequencies, or patterns:
+- Analyze ALL provided sources
+- Count mentions across different articles
+- Note publication dates to verify they match the requested timeframe
+- Provide specific examples with citations
+
+Question: {prompt}
+Answer: """
+                    
+                    # Stream response
+                    response_placeholder = st.empty()
+                    full_response = ""
+                    
+                    stream = openai_client.chat.completions.create(
+                        model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"),
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.7,
+                        max_tokens=1500,
+                        stream=True
+                    )
+                    
+                    for chunk in stream:
+                        if chunk.choices[0].delta.content is not None:
+                            full_response += chunk.choices[0].delta.content
+                            response_placeholder.markdown(full_response + "▌")
+                    
+                    response_placeholder.markdown(full_response)
+                    
+                    # Show sources
+                    if sources:
+                        with st.expander("📚 Sources (Database View)"):
+                            for i, source in enumerate(sources, 1):
+                                st.markdown(f"**{i}. [{source['title']}]({source['url']})**")
+                                
+                                # Display all fields in a structured database-like format
+                                col1, col2 = st.columns([1, 3])
+                                
+                                with col1:
+                                    st.markdown("**📊 Database Fields:**")
+                                    st.markdown(f"**Publication Date:** {source.get('publication_date', 'N/A')}")
+                                    st.markdown(f"**Categories:** {source.get('categories', 'N/A')}")
+                                    st.markdown(f"**Dimension:** {source.get('dimension', 'N/A')}")
+                                    st.markdown(f"**Technology:** {source.get('tech', 'N/A')}")
+                                    st.markdown(f"**TRL Level:** {source.get('trl', 'N/A')}")
+                                    st.markdown(f"**Start-up:** {source.get('startup', 'N/A')}")
+                                    st.markdown(f"**Source:** {source.get('source', 'N/A')}")
+                                
+                                with col2:
+                                    st.markdown("**📝 Content Summary (Indicator):**")
+                                    indicator_text = source.get('indicator', 'N/A')
+                                    # Display full indicator text without truncation
+                                    st.markdown(indicator_text)
+                                
+                                st.divider()
+                    
+                    # Add assistant response to chat history
+                    st.session_state.chat_messages.append({
+                        "role": "assistant",
+                        "content": full_response,
+                        "sources": sources
+                    })
+                    
+                except Exception as e:
+                    st.error(f"Error generating response: {e}")
+                    st.stop()
+
+
 elif page == "About":
     st.header("About Technology Intelligence Tool")
 
@@ -3814,13 +3971,13 @@ elif page == "About":
 
     **3. LLM Extraction**
     - **Structured Metadata** - AI extracts title, summary, author, publication date
-    - **Tech Intelligence** - Dimension, Tech, TRL, Start-up classification
+    - **Tech Intelligence** - Dimension, Tech, TRL, URL to start-ups classification
     - **Smart Filtering** - Auto-removes empty content and dates >2 years old
     - **Dual Format** - Outputs both CSV and JSON to processed_data folder
     - **S3 Upload** - Both formats automatically uploaded to cloud storage
 
     **4. Summarization**
-    - **Tech-Intel Analysis** - AI generates Indicator, Dimension, Tech, TRL, Start-up fields
+    - **Tech-Intel Analysis** - AI generates Indicator, Dimension, Tech, TRL, URL to start-ups fields
     - **Auto-save** - Files automatically saved and uploaded to S3 after completion
     - **Processing History** - Track all processed files with metadata
     - **Preview Mode** - View first 5 entries with original vs analyzed content
@@ -3834,15 +3991,7 @@ elif page == "About":
     - **Bulk Export** - Export filtered or complete database
     - **Text Selection** - Copy text from any cell in the table
 
-    **6. RAG (Retrieval-Augmented Generation)**
-    - **Multi-Source Indexing** - Create vector indexes from JSON files
-    - **Smart Search** - Semantic search with date-based relevance sorting
-    - **LLM Providers** - Support for Azure OpenAI, OpenAI, and LM Studio
-    - **S3 Persistence** - Indexes automatically sync to/from AWS S3
-    - **Index Management** - List, load, query, and delete indexes
-    - **Cloud Restore** - Auto-download indexes from S3 if missing locally
-
-    **7. LinkedIn Home Feed Monitor**
+    **6. LinkedIn Home Feed Monitor**
     - **Automated Scraping** - Collects posts from LinkedIn home feed
     - **Smart Filtering** - Excludes promoted/suggested/reposted content
     - **Content Processing** - Extracts author, date, content, and URLs
@@ -3861,7 +4010,6 @@ elif page == "About":
     ✅ **Multi-Format** - CSV, JSON, Markdown outputs  
     ✅ **Real-time Progress** - Live tracking with time estimates  
     ✅ **Smart Filtering** - Automatic cleanup of irrelevant content  
-    ✅ **Vector Search** - RAG with semantic retrieval  
     ✅ **Social Intelligence** - LinkedIn network monitoring  
     ✅ **Batch Processing** - Handle large datasets efficiently  
     ✅ **History Tracking** - Complete audit trail of all operations  
@@ -3869,11 +4017,11 @@ elif page == "About":
     ### Technology Stack
 
     - **Frontend:** Streamlit with AgGrid
-    - **AI Models:** Azure OpenAI (GPT-4.1-mini, text-embedding-3-large)
+    - **AI Models:** OpenAI (gpt-4o, gpt-4o-mini, text-embedding-3-large)
     - **Alternative LLMs:** OpenAI, LM Studio (local)
     - **Search Engine:** SearxNG
     - **Web Automation:** Selenium WebDriver
-    - **Vector Store:** LlamaIndex with ChromaDB
+    - **Vector Store:** Simple in-memory keyword search
     - **Cloud Storage:** AWS S3 (boto3)
     - **Validation:** Pydantic
     - **Agent Framework:** Pydantic AI
@@ -3887,20 +4035,18 @@ elif page == "About":
     - **crawled_data/** - Web crawler outputs (CSV, JSON)
     - **processed_data/** - LLM extraction outputs (CSV, JSON)
     - **summarised_content/** - Summarization outputs (CSV, JSON)
-    - **rag_embeddings/** - Vector indexes (ZIP)
     - **linkedin_data/** - LinkedIn posts (CSV, JSON)
 
     **Features:**
     - ✅ Automatic upload after processing
-    - ✅ Download and delete via UI (LinkedIn, RAG)
-    - ✅ Auto-sync for RAG indexes
+    - ✅ Download and delete via UI (LinkedIn)
     - ✅ Graceful fallback if S3 unavailable
 
     ### Usage Workflow
 
     **Complete Research Pipeline:**
     ```
-    Web Search → Web Crawler → URL Filter → LLM Extraction → Summarization → Database/RAG
+    Web Search → Web Crawler → URL Filter → LLM Extraction → Summarization → Database
     ```
 
     **LinkedIn Intelligence:**
@@ -3953,14 +4099,6 @@ elif page == "About":
     5. Switch between view modes
     6. Export filtered or complete data
 
-    **RAG:**
-    1. Navigate to "RAG" tab
-    2. Select JSON files to index
-    3. Create vector index (auto-uploaded to S3)
-    4. Query with natural language
-    5. Get relevant documents with sources
-    6. Indexes sync across machines via S3
-
     **LinkedIn Monitor:**
     1. Navigate to "LinkedIn Home Feed Monitor"
     2. Configure scraping settings (scrolls, delay, days back)
@@ -3989,7 +4127,6 @@ elif page == "About":
     ├── crawled_data/              # Crawled and filtered CSVs
     ├── processed_data/            # LLM extraction outputs
     ├── summarised_content/        # Summarized CSVs and JSONs
-    ├── rag_embeddings/            # Compressed vector indexes
     └── linkedin_data/             # LinkedIn posts CSVs/JSONs
     ```
 
@@ -3998,7 +4135,6 @@ elif page == "About":
     - **Logs:** Check `research.log` for detailed operation logs
     - **S3 Status:** Run `python3 check_s3_status.py` to verify bucket contents
     - **Upload Missing Files:** Use `python3 upload_linkedin_to_s3.py` for backfill
-    - **RAG Issues:** Indexes auto-download from S3 if missing locally
     - **LinkedIn:** Monitor uses standard Selenium, ensure ChromeDriver installed. A Linkedin account was created solely for this tool.
 
     ---
@@ -4146,7 +4282,7 @@ elif page == "LinkedIn Home Feed Monitor":
         enable_translation = st.checkbox(
             "Enable Translation",
             value=True,
-            help="Automatically translate non-English posts to English using Azure OpenAI"
+            help="Automatically translate non-English posts to English using OpenAI"
         )
         
         output_dir = st.text_input(
@@ -4204,7 +4340,7 @@ elif page == "LinkedIn Home Feed Monitor":
         from selenium.webdriver.common.by import By
         from selenium.webdriver.chrome.options import Options
         from selenium.common.exceptions import ElementClickInterceptedException
-        from openai import AzureOpenAI
+        from openai import OpenAI
         
         # Status display
         status_placeholder = status_container.empty()
@@ -4239,17 +4375,17 @@ elif page == "LinkedIn Home Feed Monitor":
             
             return word_count >= 5
         
-        def translate_to_english(text, azure_client):
-            """Translate text to English using Azure OpenAI API"""
-            if not text or not text.strip() or not azure_client:
+        def translate_to_english(text, openai_client):
+            """Translate text to English using OpenAI API"""
+            if not text or not text.strip() or not openai_client:
                 return text
             
             if is_english(text):
                 return text
             
             try:
-                response = azure_client.chat.completions.create(
-                    model=os.getenv("AZURE_OPENAI_MODEL_NAME", "gpt-4"),
+                response = openai_client.chat.completions.create(
+                    model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"),
                     messages=[
                         {"role": "system", "content": "You are a professional translator. Translate the following text to English. Only return the translated text, nothing else."},
                         {"role": "user", "content": text}
@@ -4329,7 +4465,7 @@ elif page == "LinkedIn Home Feed Monitor":
             
             return driver.execute_script("return window.pageYOffset + window.innerHeight;")
         
-        def parse_post(post_element, azure_client, enable_translation):
+        def parse_post(post_element, openai_client, enable_translation):
             """Parse a LinkedIn post element with comprehensive author extraction"""
             try:
                 # Skip promoted/suggested/reposted/liked posts
@@ -4481,8 +4617,8 @@ elif page == "LinkedIn Home Feed Monitor":
                     except:
                         continue
                 
-                if enable_translation and content and azure_client:
-                    content = translate_to_english(content, azure_client)
+                if enable_translation and content and openai_client:
+                    content = translate_to_english(content, openai_client)
                 
                 # Extract URLs
                 urls = " | ".join([a.get_attribute("href") for a in post_element.find_elements(By.TAG_NAME, "a") 
@@ -4499,17 +4635,16 @@ elif page == "LinkedIn Home Feed Monitor":
                 return None
         
         try:
-            # Initialize Azure OpenAI if translation is enabled
-            azure_client = None
+            # Initialize OpenAI if translation is enabled
+            openai_client = None
             if enable_translation:
                 try:
-                    azure_client = AzureOpenAI(
-                        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-                        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-                        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+                    openai_client = OpenAI(
+                        api_key=os.getenv("OPENAI_API_KEY"),
+                        base_url="https://api.openai.com/v1"
                     )
                 except Exception as e:
-                    status_placeholder.warning(f"⚠️ Could not initialize Azure OpenAI: {e}\nTranslation disabled.")
+                    status_placeholder.warning(f"⚠️ Could not initialize OpenAI: {e}\nTranslation disabled.")
             
             # Setup Chrome driver
             chrome_options = Options()
@@ -4563,7 +4698,7 @@ elif page == "LinkedIn Home Feed Monitor":
                     if post_element in posts:
                         continue
                     
-                    data = parse_post(post_element, azure_client, enable_translation)
+                    data = parse_post(post_element, openai_client, enable_translation)
                     if data and data not in results:
                         # Parse the post date to check if it's within the limit
                         try:
@@ -4842,11 +4977,10 @@ st.sidebar.markdown("#### 🤖 LLM Provider")
 from config.model_config import MODEL_OPTIONS, get_available_providers
 
 # Get current provider from environment
-current_provider = os.getenv("LLM_PROVIDER", "azure").lower()
+current_provider = os.getenv("LLM_PROVIDER", "openai").lower()
 
 # Map provider codes to display names
 provider_display_map = {
-    "azure": "Azure OpenAI",
     "openai": "OpenAI",
     "lm_studio": "LM Studio (Local)"
 }
@@ -4882,11 +5016,8 @@ if provider_options:
         st.sidebar.success(f"✅ Switched to {selected_provider_display}")
     
     # Show provider-specific info
-    if selected_provider == "azure":
-        model_name = os.getenv("AZURE_OPENAI_MODEL_NAME", "gpt-4")
-        st.sidebar.caption(f"Model: {model_name}")
-    elif selected_provider == "openai":
-        model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4")
+    if selected_provider == "openai":
+        model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
         st.sidebar.caption(f"Model: {model_name}")
     elif selected_provider == "lm_studio":
         base_url = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")

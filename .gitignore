@@ -62,6 +62,12 @@ crawled_data/
 crawl_output/
 processed_data/
 summarised_content/
+rag_storage/
+embeddings_storage/
+linkedin_posts_monitor/
+data/
+temp/
+tests/
 
 # Temporary files
 *.tmp

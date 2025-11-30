@@ -46,7 +46,7 @@ mentioned in the article, make sure they are captured. Avoid generic openers lik
     - 6-7: Prototype testing in relevant/operational environment
     - 8-9: System proven and commercially deployed
 
-- Start-up: If the news is about a start-up, include a link to the start-up's official webpage. If multiple sources, separate with semicolons. If not applicable, write "N/A".
+- URL to start-ups: If the news is about a start-up, include a link to the start-up's official webpage. If multiple sources, separate with semicolons. If not applicable, write "N/A".
 
 Output Format:
 Provide your response in the following exact format, one field per line:
@@ -55,7 +55,7 @@ INDICATOR: [your 1-paragraph summary here]
 DIMENSION: [abbreviation only: Tech/Pol/Econ/Env&S/Legal&R/Social&E]
 TECH: [specific technology domain]
 TRL: [number 1-9]
-START-UP: [URL or N/A]
+URL TO START-UPS: [URL or N/A]
 """
 
 
@@ -110,7 +110,7 @@ def parse_structured_output(output: str) -> dict:
                 result['tech'] = line.split(':', 1)[1].strip()
             elif line.upper().startswith('TRL:'):
                 result['trl'] = line.split(':', 1)[1].strip()
-            elif line.upper().startswith('START-UP:') or line.upper().startswith('STARTUP:'):
+            elif line.upper().startswith('URL TO START-UPS:') or line.upper().startswith('START-UP:') or line.upper().startswith('STARTUP:'):
                 result['start_up'] = line.split(':', 1)[1].strip()
     
     except Exception as e:
@@ -204,7 +204,7 @@ async def summarize_csv_file(
     df['Dimension'] = None
     df['Tech'] = None
     df['TRL'] = None
-    df['Start-up'] = None
+    df['URL to start-ups'] = None
     
     # Track processing stats
     total_rows = len(df)
@@ -224,7 +224,7 @@ async def summarize_csv_file(
                 df.loc[idx, 'Indicator'] = "[Empty content - no summary generated]"  # type: ignore
                 df.loc[idx, 'Dimension'] = ''  # type: ignore
                 df.loc[idx, 'Tech'] = ''  # type: ignore
-                df.loc[idx, 'Start-up'] = ''  # type: ignore
+                df.loc[idx, 'URL to start-ups'] = ''  # type: ignore
                 failed += 1
                 logging.warning(f"Row {row_num + 1}/{total_rows} has no content to process")
                 continue
@@ -237,7 +237,7 @@ async def summarize_csv_file(
             df.loc[idx, 'Dimension'] = structured_data.get('dimension', '')  # type: ignore
             df.loc[idx, 'Tech'] = structured_data.get('tech', '')  # type: ignore
             df.loc[idx, 'TRL'] = structured_data.get('trl', '')  # type: ignore
-            df.loc[idx, 'Start-up'] = structured_data.get('start_up', '')  # type: ignore
+            df.loc[idx, 'URL to start-ups'] = structured_data.get('start_up', '')  # type: ignore
             
             successful += 1
             
@@ -248,7 +248,7 @@ async def summarize_csv_file(
             df.loc[idx, 'Indicator'] = f"[Error: {str(e)}]"  # type: ignore
             df.loc[idx, 'Dimension'] = ''  # type: ignore
             df.loc[idx, 'Tech'] = ''  # type: ignore
-            df.loc[idx, 'Start-up'] = ''  # type: ignore
+            df.loc[idx, 'URL to start-ups'] = ''  # type: ignore
             failed += 1
         
         # Calculate progress and time estimates
@@ -326,10 +326,25 @@ def save_summarized_csv(
     # Format date columns to ISO date format (YYYY-MM-DD) without time
     df_copy = df.copy()
     
+    # Fill missing publication_date with current processing date
+    current_processing_date = datetime.now().strftime('%Y-%m-%d')
+    if 'publication_date' in df_copy.columns:
+        # Replace None, NaN, empty strings, or 'None' string with current date
+        missing_date_mask = (
+            df_copy['publication_date'].isna() | 
+            (df_copy['publication_date'].astype(str).str.strip() == '') |
+            (df_copy['publication_date'].astype(str) == 'None') |
+            (df_copy['publication_date'].astype(str).str.lower() == 'nan')
+        )
+        df_copy.loc[missing_date_mask, 'publication_date'] = current_processing_date
+        filled_count = missing_date_mask.sum()
+        if filled_count > 0:
+            logging.info(f"Filled {filled_count} missing publication dates with current date: {current_processing_date}")
+    
     # Define the required output columns in the correct order
     required_columns = [
         'filename', 'filepath', 'url', 'title', 'publication_date', 
-        'content', 'categories', 'Indicator', 'Dimension', 'Tech', 'TRL', 'Start-up'
+        'content', 'categories', 'Indicator', 'Dimension', 'Tech', 'TRL', 'URL to start-ups'
     ]
     
     # Select only the required columns that exist in the dataframe

@@ -17,12 +17,8 @@ llama-index-llms-openai>=0.2.0
 selenium>=4.0.0
 boto3>=1.26.0
 botocore>=1.34.0
-<<<<<<< HEAD
-streamlit-agraph>=0.0.43
 llama-index-embeddings-azure-openai
-=======
 streamlit
-streamlit-agraph
 streamlit-aggrid
 anthropic
 pydantic
@@ -45,9 +41,8 @@ llama-index-embeddings-openai
 llama-index-embeddings-azure-openai
 llama-index-llms-openai
 llama-index-llms-azure-openai
-chromadb
 openai
 plotly
 Pillow
 openpyxl
->>>>>>> 1c5319d (Add streamlit-agraph to requirements.txt)
+gensim>=4.0.0

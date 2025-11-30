@@ -230,6 +230,33 @@ Use AI models to intelligently extract structured metadata from markdown files:
    * Author
    * Tags/Categories
 
+**🔄 Interrupt Handling & Progress Preservation**
+The LLM extraction process now supports resumable processing with automatic checkpointing:
+
+- **Automatic Checkpointing**: Progress is saved every 10 processed items (configurable)
+- **Interrupt Recovery**: If processing is interrupted (Ctrl+C, connection loss, system crash), progress is preserved
+- **Resume Functionality**: Automatically resumes from the last checkpoint when restarted
+- **Graceful Shutdown**: Ctrl+C triggers clean shutdown with progress saving
+
+**Usage:**
+```python
+# Process with checkpointing enabled (default)
+df, stats = await process_csv_with_progress(
+    csv_path=csv_file,
+    output_dir=output_dir,
+    client=client,
+    model_name="gpt-4",
+    checkpoint_interval=10,  # Save every 10 rows
+    resume_from_checkpoint=True  # Resume from existing checkpoint
+)
+```
+
+**Benefits:**
+- ✅ No progress loss from interruptions
+- ✅ Can pause/resume long-running extractions
+- ✅ Automatic cleanup of checkpoints after successful completion
+- ✅ Works with both CSV files and folder processing
+
 ### 4. Summarisation 
 Upload or select processed CSV files from S3 to perform summarization and classification:
    * **Indicator**: A concise summary focusing on the key technological development, event, or trend described.
@@ -299,6 +326,28 @@ https://github.com/user-attachments/assets/813787e0-2526-40b6-a148-da4eb46a82bc
 
 ---
 
+## Streamlit Interface
+
+The application provides an intuitive web interface with advanced features for managing long-running processes:
+
+### Checkpoint Management
+- **Automatic Detection**: Interface detects existing checkpoint files and shows current progress
+- **Resume Options**: Checkbox to enable resuming from saved checkpoints
+- **Configurable Intervals**: Set checkpoint saving frequency (default: every 10 items)
+- **Progress Metrics**: Real-time display of processing status and completion percentage
+
+### Interrupt Handling
+- **Graceful Shutdown**: Ctrl+C or stop button triggers clean interruption with progress saving
+- **No Progress Loss**: All completed work is preserved even after interruptions
+- **Resume Capability**: Restart processing from exactly where it left off
+
+### Real-time Monitoring
+- **Live Progress Bars**: Visual indicators for extraction and summarization progress
+- **Status Updates**: Current operation and estimated completion time
+- **Error Handling**: Clear error messages with recovery suggestions
+
+---
+
 ## Tech Stack
 
 | Category | Technologies |
@@ -308,7 +357,7 @@ https://github.com/user-attachments/assets/813787e0-2526-40b6-a148-da4eb46a82bc
 | **RAG** | LlamaIndex, OpenAI Embeddings |
 | **Web** | Playwright, BeautifulSoup4, Trafilatura, SearXNG |
 | **Data** | Pandas, NumPy |
-| **UI** | Streamlit-AgGrid, Streamlit-Agraph |
+| **UI** | Streamlit-AgGrid |
 | **Storage** | CSV, JSON, LlamaIndex Vector Store |
 
 ---
@@ -359,9 +408,14 @@ Configure in the Summarization or RAG pages.
 
 1. Go to **LLM Extraction**
 2. Select folder: `canarymedia`
-3. Configure extraction fields
-4. Click **Start Extraction**
-5. Files saved to extraction output folder
+3. **Configure Checkpointing** (optional):
+   - Enable **Resume from Checkpoint** to continue interrupted processing
+   - Set **Checkpoint Interval** (default: 10 items)
+   - View current progress if checkpoint exists
+4. Configure extraction fields
+5. Click **Start Extraction**
+6. **Interrupt Handling**: Use Ctrl+C in terminal or stop button to pause gracefully
+7. Files saved to extraction output folder with automatic progress preservation
 
 ### Example 3: Generate Tech Intelligence
 
@@ -423,6 +477,24 @@ Configure in the Summarization or RAG pages.
 - Monitor in terminal: `watch -n 1 'ls -lh crawled_data/{folder} | tail -20'`
 - Check output folder for new files
 - The process IS running even if UI freezes
+
+### "Checkpoint file not found"
+
+**Cause**: Previous processing completed successfully and checkpoint was cleaned up
+
+**Solution**:
+- Check if processing already completed in output folder
+- Start fresh extraction if needed
+- Check `processed_data/` for completed files
+
+### "Resume failed - invalid checkpoint"
+
+**Cause**: Checkpoint file corrupted or incompatible with current code version
+
+**Solution**:
+- Delete the checkpoint file manually
+- Restart processing from beginning
+- Ensure using compatible code version
 
 ### "No JSON files found"
 

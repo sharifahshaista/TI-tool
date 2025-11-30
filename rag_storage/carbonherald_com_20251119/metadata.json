@@ -1,8 +1,0 @@
-{
-  "source_file": "summarised_content/carbonherald_com_20251119.json",
-  "num_documents": 261,
-  "created_at": "2025-11-20T12:17:20.792295",
-  "embedding_model": "text-embedding-3-large",
-  "llm_provider": "azure_openai",
-  "llm_model": "pmo-gpt-4.1-nano"
-}

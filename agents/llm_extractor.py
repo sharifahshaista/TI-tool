@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import signal
 import pandas as pd
 from pathlib import Path
 from typing import List, Optional, Callable
@@ -13,6 +14,7 @@ try:
     from aws_storage import get_storage
     HAS_S3_STORAGE = True
 except ImportError:
+    get_storage = None  # type: ignore
     HAS_S3_STORAGE = False
 
 # Support for multiple LLM providers
@@ -29,6 +31,109 @@ class ArticleExtraction(BaseModel):
     main_content: str = ""
     categories: List[str] = Field(default_factory=list)
 
+# Checkpoint Manager for resumable processing
+class CheckpointManager:
+    """Manages checkpoints for resumable LLM extraction processing."""
+    
+    def __init__(self, checkpoint_file: Path):
+        self.checkpoint_file = checkpoint_file
+        self.checkpoint_data = {
+            'processed_indices': set(),
+            'extracted_data': [],
+            'start_time': None,
+            'last_save_time': None,
+            'total_rows': 0,
+            'current_row': 0
+        }
+        self.load_checkpoint()
+    
+    def load_checkpoint(self):
+        """Load existing checkpoint if available."""
+        if self.checkpoint_file.exists():
+            try:
+                with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.checkpoint_data.update(data)
+                    # Convert processed_indices back to set
+                    self.checkpoint_data['processed_indices'] = set(self.checkpoint_data.get('processed_indices', []))
+                print(f"✅ Loaded checkpoint from {self.checkpoint_file}")
+                print(f"   - Processed {len(self.checkpoint_data['processed_indices'])} rows")
+                print(f"   - Current row: {self.checkpoint_data.get('current_row', 0)}")
+            except Exception as e:
+                print(f"⚠️ Failed to load checkpoint: {e}")
+    
+    def save_checkpoint(self, current_row: int, extracted_data: list, total_rows: int):
+        """Save current progress to checkpoint file."""
+        self.checkpoint_data['processed_indices'] = list(self.checkpoint_data['processed_indices'])
+        self.checkpoint_data['extracted_data'] = extracted_data
+        self.checkpoint_data['current_row'] = current_row
+        self.checkpoint_data['total_rows'] = total_rows
+        self.checkpoint_data['last_save_time'] = datetime.now().isoformat()
+        
+        try:
+            # Ensure directory exists
+            self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(self.checkpoint_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"💾 Checkpoint saved: {len(self.checkpoint_data['processed_indices'])} rows processed")
+        except Exception as e:
+            print(f"⚠️ Failed to save checkpoint: {e}")
+    
+    def is_processed(self, row_index: int) -> bool:
+        """Check if a row has already been processed."""
+        return row_index in self.checkpoint_data['processed_indices']
+    
+    def mark_processed(self, row_index: int):
+        """Mark a row as processed."""
+        self.checkpoint_data['processed_indices'].add(row_index)
+    
+    def get_resume_point(self) -> int:
+        """Get the row index to resume from."""
+        if self.checkpoint_data['processed_indices']:
+            return max(self.checkpoint_data['processed_indices']) + 1
+        return 0
+    
+    def get_saved_data(self) -> list:
+        """Get the extracted data from checkpoint."""
+        return self.checkpoint_data.get('extracted_data', [])
+    
+    def cleanup(self):
+        """Remove checkpoint file after successful completion."""
+        if self.checkpoint_file.exists():
+            try:
+                self.checkpoint_file.unlink()
+                print(f"🗑️ Checkpoint file removed: {self.checkpoint_file}")
+            except Exception as e:
+                print(f"⚠️ Failed to remove checkpoint file: {e}")
+
+# Global flag for interrupt handling
+interrupted = False
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals (Ctrl+C)."""
+    global interrupted
+    interrupted = True
+    print("\n⚠️ Interrupt signal received. Saving progress and exiting gracefully...")
+
+# Register signal handler only if running as main script
+# (not when imported as module in Streamlit/other multi-threaded environments)
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+
+def setup_interrupt_handling():
+    """
+    Set up interrupt signal handling for graceful shutdown.
+    Call this before starting long-running processing operations.
+    """
+    try:
+        signal.signal(signal.SIGINT, signal_handler)
+    except ValueError as e:
+        # Signal handling not available in this context (e.g., Streamlit)
+        print(f"⚠️ Signal handling not available: {e}")
+        print("   Interrupt handling will not work, but processing can still be stopped manually.")
+
 # Helper function to extract JSON from LLM response
 def parse_llm_json(response_text: str):
     """Extract the first JSON object from the LLM response."""
@@ -40,7 +145,7 @@ def parse_llm_json(response_text: str):
             return None
     return None
 
-def get_openai_client(provider: str = "openai", base_url: str = None, api_key: str = None):
+def get_openai_client(provider: str = "openai", base_url: Optional[str] = None, api_key: Optional[str] = None):
     """
     Get OpenAI client based on provider configuration.
     
@@ -66,10 +171,20 @@ def get_openai_client(provider: str = "openai", base_url: str = None, api_key: s
     elif provider == "azure":
         # Azure OpenAI
         from openai import AzureOpenAI
+        
+        azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        
+        if not azure_api_key or not azure_endpoint:
+            raise ValueError(
+                "Azure OpenAI requires AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT "
+                "environment variables to be set"
+            )
+        
         return AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_key=azure_api_key,
             api_version=os.getenv("OPENAI_API_VERSION", "2023-12-01-preview"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+            azure_endpoint=azure_endpoint
         )
     else:
         # Standard OpenAI
@@ -132,7 +247,7 @@ Return a valid JSON object ONLY with these exact keys:
 
     return article, token_usage
 
-def filter_extracted_data(df: pd.DataFrame, current_date: datetime = None) -> tuple:
+def filter_extracted_data(df: pd.DataFrame, current_date: Optional[datetime] = None) -> tuple:
     """
     Filter extracted data to remove rows where:
     1. Extracted content is empty
@@ -212,10 +327,13 @@ async def process_csv_with_progress(
     client,  # OpenAI client instance (any provider)
     model_name: str,
     text_column: str = "text_content",
-    progress_callback: Optional[Callable] = None
+    progress_callback: Optional[Callable] = None,
+    checkpoint_interval: int = 10,
+    resume_from_checkpoint: bool = True
 ):
     """
     Process CSV file with LLM extraction on text_content column.
+    Supports resumable processing with checkpointing.
 
     Args:
         csv_path: Path to CSV file with crawled data
@@ -224,10 +342,17 @@ async def process_csv_with_progress(
         model_name: Model name to use
         text_column: Name of column containing text to extract from (default: "text_content")
         progress_callback: Optional callback function(message, current, total)
+        checkpoint_interval: Save checkpoint every N rows (default: 10)
+        resume_from_checkpoint: Whether to resume from existing checkpoint (default: True)
 
     Returns:
         tuple: (DataFrame, stats_dict)
     """
+    global interrupted
+    
+    # Set up interrupt handling (will fail gracefully in Streamlit)
+    setup_interrupt_handling()
+    
     start_time = time.time()
     
     # Read the CSV file
@@ -254,14 +379,51 @@ async def process_csv_with_progress(
         }
     
     total_rows = len(df)
-    processed = 0
-    failed = 0
     
-    # Prepare new columns for extracted data
+    # Initialize checkpoint manager
+    checkpoint_file = output_dir / f"{csv_path.stem}_checkpoint.json"
+    checkpoint_manager = CheckpointManager(checkpoint_file)
+    
+    # Check if we should resume from checkpoint
+    resume_point = 0
     extracted_data = []
     
-    for idx, row in df.iterrows():
-        row_num = idx + 1
+    if resume_from_checkpoint and checkpoint_manager.checkpoint_data['processed_indices']:
+        resume_point = checkpoint_manager.get_resume_point()
+        extracted_data = checkpoint_manager.get_saved_data()
+        print(f"🔄 Resuming from row {resume_point} (previously processed {len(extracted_data)} rows)")
+        
+        if progress_callback:
+            progress_callback(
+                f"Resuming from checkpoint: {len(extracted_data)} rows already processed",
+                resume_point,
+                total_rows
+            )
+    else:
+        # Reset checkpoint if not resuming
+        checkpoint_manager.checkpoint_data = {
+            'processed_indices': set(),
+            'extracted_data': [],
+            'start_time': datetime.now().isoformat(),
+            'last_save_time': None,
+            'total_rows': total_rows,
+            'current_row': 0
+        }
+    
+    processed = len(extracted_data)  # Start with already processed count
+    failed = 0
+    
+    # Prepare new columns for extracted data (only for remaining rows)
+    # Get current date for filling missing publication dates
+    current_processing_date = datetime.now().strftime('%Y-%m-%d')
+    
+    # Process remaining rows
+    for row_idx in range(resume_point, total_rows):
+        if interrupted:
+            print("\n🛑 Processing interrupted by user. Saving current progress...")
+            break
+        
+        row_num = row_idx + 1
         
         # Update progress
         if progress_callback:
@@ -273,7 +435,7 @@ async def process_csv_with_progress(
                 remaining_estimate = 0
             
             # Get URL for display (if available)
-            display_url = row.get('url', f'Row {row_num}')
+            display_url = df.iloc[row_idx].get('url', f'Row {row_num}')
             if isinstance(display_url, str) and len(display_url) > 50:
                 display_url = display_url[:50] + '...'
             
@@ -285,7 +447,7 @@ async def process_csv_with_progress(
         
         try:
             # Get text content from the specified column
-            content = str(row[text_column])
+            content = str(df.iloc[row_idx][text_column])
             
             if not content or content.strip() == '' or content == 'nan':
                 # Skip empty content
@@ -296,18 +458,29 @@ async def process_csv_with_progress(
                     "categories": ""
                 })
                 failed += 1
+                checkpoint_manager.mark_processed(row_idx)
                 continue
             
             # Extract using LLM
             result, token_usage = llm_extract(client, model_name, content)
             
+            # Set publication_date to current processing date if missing
+            pub_date = result.publication_date
+            if not pub_date or str(pub_date).strip() == '' or str(pub_date) == 'None':
+                pub_date = current_processing_date
+            
             extracted_data.append({
                 "title": result.title,
-                "publication_date": result.publication_date,
+                "publication_date": pub_date,
                 "main_content": result.main_content,
                 "categories": ', '.join(result.categories) if result.categories else ''
             })
             processed += 1
+            checkpoint_manager.mark_processed(row_idx)
+            
+            # Save checkpoint periodically
+            if processed % checkpoint_interval == 0:
+                checkpoint_manager.save_checkpoint(row_idx, extracted_data, total_rows)
             
         except Exception as e:
             print(f"Error processing row {row_num}: {e}")
@@ -318,6 +491,23 @@ async def process_csv_with_progress(
                 "categories": ""
             })
             failed += 1
+            checkpoint_manager.mark_processed(row_idx)
+    
+    # Save final checkpoint
+    checkpoint_manager.save_checkpoint(total_rows - 1, extracted_data, total_rows)
+    
+    # If processing was interrupted, don't save final results yet
+    if interrupted:
+        print(f"\n💾 Progress saved to checkpoint. Processed {processed} rows.")
+        print(f"   To resume: call process_csv_with_progress with resume_from_checkpoint=True")
+        return pd.DataFrame(), {
+            'total_rows': total_rows,
+            'processed': processed,
+            'skipped_error': failed,
+            'duration_seconds': time.time() - start_time,
+            'interrupted': True,
+            'checkpoint_file': str(checkpoint_file)
+        }
     
     # Create DataFrame from extracted data
     extracted_df = pd.DataFrame(extracted_data)
@@ -384,7 +574,7 @@ async def process_csv_with_progress(
     output_df.to_json(output_json_path, orient='records', indent=2)
     
     # Upload to S3 if available
-    if HAS_S3_STORAGE:
+    if HAS_S3_STORAGE and get_storage is not None:
         try:
             storage = get_storage()
             
@@ -400,6 +590,9 @@ async def process_csv_with_progress(
             
         except Exception as e:
             print(f"⚠️ Failed to upload to S3: {e}")
+    
+    # Clean up checkpoint file after successful completion
+    checkpoint_manager.cleanup()
     
     end_time = time.time()
     duration = end_time - start_time
@@ -425,10 +618,13 @@ async def process_folder_with_progress(
     output_dir: Path,
     client,  # OpenAI client instance (any provider)
     model_name: str,
-    progress_callback: Optional[Callable] = None
+    progress_callback: Optional[Callable] = None,
+    checkpoint_interval: int = 10,
+    resume_from_checkpoint: bool = True
 ):
     """
     Process all markdown files in a folder using LLM extraction.
+    Supports resumable processing with checkpointing.
 
     Args:
         folder_path: Path to folder containing markdown files
@@ -436,13 +632,19 @@ async def process_folder_with_progress(
         client: OpenAI client (Azure or Ollama)
         model_name: Model name to use
         progress_callback: Optional callback function(message, current, total)
+        checkpoint_interval: Save checkpoint every N files (default: 10)
+        resume_from_checkpoint: Whether to resume from existing checkpoint (default: True)
 
     Returns:
         tuple: (DataFrame, stats_dict)
     """
+    global interrupted
+    
+    # Set up interrupt handling (will fail gracefully in Streamlit)
+    setup_interrupt_handling()
+    
     start_time = time.time()
-    table = []
-
+    
     # Get all markdown files
     md_files = list(folder_path.rglob('*.md'))
     total_files = len(md_files)
@@ -454,12 +656,52 @@ async def process_folder_with_progress(
             'skipped_error': 0,
             'duration_seconds': 0
         }
-
-    processed = 0
+    
+    # Initialize checkpoint manager
+    checkpoint_file = output_dir / f"{folder_path.name}_checkpoint.json"
+    checkpoint_manager = CheckpointManager(checkpoint_file)
+    
+    # Check if we should resume from checkpoint
+    resume_point = 0
+    table = []
+    
+    if resume_from_checkpoint and checkpoint_manager.checkpoint_data['processed_indices']:
+        resume_point = checkpoint_manager.get_resume_point()
+        table = checkpoint_manager.get_saved_data()
+        print(f"🔄 Resuming from file {resume_point} (previously processed {len(table)} files)")
+        
+        if progress_callback:
+            progress_callback(
+                f"Resuming from checkpoint: {len(table)} files already processed",
+                resume_point,
+                total_files
+            )
+    else:
+        # Reset checkpoint if not resuming
+        checkpoint_manager.checkpoint_data = {
+            'processed_indices': set(),
+            'extracted_data': [],
+            'start_time': datetime.now().isoformat(),
+            'last_save_time': None,
+            'total_rows': total_files,
+            'current_row': 0
+        }
+    
+    processed = len(table)  # Start with already processed count
     failed = 0
+    
+    # Get current date for filling missing publication dates
+    current_processing_date = datetime.now().strftime('%Y-%m-%d')
 
-    for idx, file_path in enumerate(md_files, 1):
+    # Process remaining files
+    for idx in range(resume_point, total_files):
+        if interrupted:
+            print("\n🛑 Processing interrupted by user. Saving current progress...")
+            break
+        
+        file_path = md_files[idx]
         file_name = file_path.name
+        file_num = idx + 1
 
         # Update progress
         if progress_callback:
@@ -472,7 +714,7 @@ async def process_folder_with_progress(
 
             progress_callback(
                 f"Processing: {file_name}",
-                idx,
+                file_num,
                 total_files
             )
 
@@ -482,17 +724,27 @@ async def process_folder_with_progress(
 
             # Extract using LLM
             result, token_usage = llm_extract(client, model_name, content)
+            
+            # Set publication_date to current processing date if missing
+            pub_date = result.publication_date
+            if not pub_date or str(pub_date).strip() == '' or str(pub_date) == 'None':
+                pub_date = current_processing_date
 
             table.append({
                 "filename": file_name,
                 "filepath": str(file_path),
                 "url": result.url,
                 "title": result.title,
-                "publication_date": result.publication_date,
+                "publication_date": pub_date,
                 "content": result.main_content,
                 "categories": ', '.join(result.categories) if result.categories else ''
             })
             processed += 1
+            checkpoint_manager.mark_processed(idx)
+            
+            # Save checkpoint periodically
+            if processed % checkpoint_interval == 0:
+                checkpoint_manager.save_checkpoint(idx, table, total_files)
 
         except Exception as e:
             print(f"Error processing {file_name}: {e}")
@@ -501,11 +753,28 @@ async def process_folder_with_progress(
                 "filepath": str(file_path),
                 "url": None,
                 "title": None,
-                "publication_date": None,
+                "publication_date": current_processing_date,  # Use current date even for errors
                 "content": "",
                 "categories": ""
             })
             failed += 1
+            checkpoint_manager.mark_processed(idx)
+    
+    # Save final checkpoint
+    checkpoint_manager.save_checkpoint(total_files - 1, table, total_files)
+    
+    # If processing was interrupted, don't save final results yet
+    if interrupted:
+        print(f"\n💾 Progress saved to checkpoint. Processed {processed} files.")
+        print(f"   To resume: call process_folder_with_progress with resume_from_checkpoint=True")
+        return pd.DataFrame(), {
+            'total_files': total_files,
+            'processed': processed,
+            'skipped_error': failed,
+            'duration_seconds': time.time() - start_time,
+            'interrupted': True,
+            'checkpoint_file': str(checkpoint_file)
+        }
 
     # Create DataFrame
     df = pd.DataFrame(table)
@@ -526,7 +795,7 @@ async def process_folder_with_progress(
     df.to_json(json_path, orient='records', indent=2)
     
     # Upload to S3 if available
-    if HAS_S3_STORAGE:
+    if HAS_S3_STORAGE and get_storage is not None:
         try:
             storage = get_storage()
             
@@ -537,12 +806,14 @@ async def process_folder_with_progress(
             
             # Upload JSON to S3
             s3_json_key = f"processed_data/{source_name}_{date_str}.json"
-            with open(json_path, 'rb') as f:
-                storage.upload_file(f, s3_json_key)
+            storage.upload_file(str(json_path), s3_json_key)
             print(f"✅ Uploaded JSON to S3: {s3_json_key}")
             
         except Exception as e:
             print(f"⚠️ Failed to upload to S3: {e}")
+    
+    # Clean up checkpoint file after successful completion
+    checkpoint_manager.cleanup()
 
     end_time = time.time()
     duration = end_time - start_time
