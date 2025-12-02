@@ -161,17 +161,20 @@ st.markdown("""
         border-right: 2px solid #000000 !important;
     }
     
-    /* Make sidebar resizable with a minimum width */
-    section[data-testid="stSidebar"] {
+    /* Sidebar width settings - only when expanded */
+    section[data-testid="stSidebar"]:not([aria-hidden="true"]) {
         min-width: 350px !important;
-        max-width: 800px !important;
-        resize: horizontal !important;
-        overflow: auto !important;
+        width: 450px !important;
     }
     
-    section[data-testid="stSidebar"] > div {
+    section[data-testid="stSidebar"]:not([aria-hidden="true"]) > div {
         min-width: 350px !important;
-        width: 100% !important;
+    }
+    
+    /* Ensure sidebar collapse/expand works properly */
+    section[data-testid="stSidebar"][aria-hidden="true"] {
+        min-width: 0 !important;
+        width: 0 !important;
     }
     
     /* Auto-adjust multiselect widget to use full sidebar width */
