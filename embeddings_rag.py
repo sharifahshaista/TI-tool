@@ -187,7 +187,7 @@ Categories: {entry.get('categories', '')}
 Technology: {entry.get('Tech', '')}
 Dimension: {entry.get('Dimension', '')}
 TRL: {entry.get('TRL', '')}
-Start-up: {entry.get('Start-up', '')}
+Start-up: {entry.get('URL to start-up(s)', '')}
 Date: {entry.get('publication_date', '')}
 
 Content: {indicator}"""
@@ -242,7 +242,7 @@ Content: {indicator}"""
                 "dimension": entry.get("Dimension", ""),
                 "tech": entry.get("Tech", ""),
                 "trl": float(entry.get("TRL", 0.0)) if entry.get("TRL") else 0.0,
-                "startup": entry.get("Start-up", "") or entry.get("URL to start-ups", ""),
+                "startup": entry.get("URL to start-up(s)", "") or entry.get("URL to start-ups", ""),
                 "chunk_index": chunk["chunk_index"],
                 "total_chunks": chunk["total_chunks"],
                 "full_indicator": indicator  # Store complete indicator
@@ -1174,7 +1174,7 @@ class LlamaIndexRAG:
                 'dimension': article.get('Dimension') or article.get('dimension') or '',
                 'tech': article.get('Tech') or article.get('tech') or '',
                 'trl': str(article.get('TRL') or article.get('trl') or ''),
-                'startup': article.get('Start-up') or article.get('Start_up') or article.get('start_up') or '',
+                'startup': article.get('URL to start-up(s)') or article.get('Start_up') or article.get('start_up') or '',
                 'indicator': article.get('Indicator') or article.get('indicator') or '',
                 'impact': article.get('Impact') or article.get('impact') or '',
                 'sentiment': article.get('Sentiment') or article.get('sentiment') or '',

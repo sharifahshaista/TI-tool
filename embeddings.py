@@ -74,7 +74,7 @@ class CSVEmbeddingProcessor:
                 "dimension": doc.get("Dimension", ""),
                 "tech": doc.get("Tech", ""),
                 "trl": doc.get("TRL", ""),
-                "startup": doc.get("URL to start-ups", ""),
+                "startup": doc.get("URL to start-up(s)", ""),
                 "full_indicator": doc.get("Indicator", "")
             } for doc in results]]
         }

@@ -46,7 +46,7 @@ mentioned in the article, make sure they are captured. Avoid generic openers lik
     - 6-7: Prototype testing in relevant/operational environment
     - 8-9: System proven and commercially deployed
 
-- URL to start-ups: If the news is about a start-up, include a link to the start-up's official webpage. If multiple sources, separate with semicolons. If not applicable, write "N/A".
+- URL to start-up(s): If the news is about a start-up, include a link to the start-up's official webpage. If multiple sources, separate with semicolons. If not applicable, write "N/A".
 
 Output Format:
 Provide your response in the following exact format, one field per line:
@@ -55,7 +55,7 @@ INDICATOR: [your 1-paragraph summary here]
 DIMENSION: [abbreviation only: Tech/Pol/Econ/Env&S/Legal&R/Social&E]
 TECH: [specific technology domain]
 TRL: [number 1-9]
-URL TO START-UPS: [URL or N/A]
+URL TO START-UP(S): [URL or N/A]
 """
 
 
@@ -110,7 +110,7 @@ def parse_structured_output(output: str) -> dict:
                 result['tech'] = line.split(':', 1)[1].strip()
             elif line.upper().startswith('TRL:'):
                 result['trl'] = line.split(':', 1)[1].strip()
-            elif line.upper().startswith('URL TO START-UPS:') or line.upper().startswith('START-UP:') or line.upper().startswith('STARTUP:'):
+            elif line.upper().startswith('URL TO START-UP(S):') or line.upper().startswith('URL TO START-UPS:') or line.upper().startswith('START-UP:') or line.upper().startswith('STARTUP:'):
                 result['start_up'] = line.split(':', 1)[1].strip()
     
     except Exception as e:
@@ -204,7 +204,7 @@ async def summarize_csv_file(
     df['Dimension'] = None
     df['Tech'] = None
     df['TRL'] = None
-    df['URL to start-ups'] = None
+    df['URL to start-up(s)'] = None
     
     # Track processing stats
     total_rows = len(df)
@@ -224,7 +224,7 @@ async def summarize_csv_file(
                 df.loc[idx, 'Indicator'] = "[Empty content - no summary generated]"  # type: ignore
                 df.loc[idx, 'Dimension'] = ''  # type: ignore
                 df.loc[idx, 'Tech'] = ''  # type: ignore
-                df.loc[idx, 'URL to start-ups'] = ''  # type: ignore
+                df.loc[idx, 'URL to start-up(s)'] = ''  # type: ignore
                 failed += 1
                 logging.warning(f"Row {row_num + 1}/{total_rows} has no content to process")
                 continue
@@ -237,7 +237,7 @@ async def summarize_csv_file(
             df.loc[idx, 'Dimension'] = structured_data.get('dimension', '')  # type: ignore
             df.loc[idx, 'Tech'] = structured_data.get('tech', '')  # type: ignore
             df.loc[idx, 'TRL'] = structured_data.get('trl', '')  # type: ignore
-            df.loc[idx, 'URL to start-ups'] = structured_data.get('start_up', '')  # type: ignore
+            df.loc[idx, 'URL to start-up(s)'] = structured_data.get('start_up', '')  # type: ignore
             
             successful += 1
             
@@ -248,7 +248,7 @@ async def summarize_csv_file(
             df.loc[idx, 'Indicator'] = f"[Error: {str(e)}]"  # type: ignore
             df.loc[idx, 'Dimension'] = ''  # type: ignore
             df.loc[idx, 'Tech'] = ''  # type: ignore
-            df.loc[idx, 'URL to start-ups'] = ''  # type: ignore
+            df.loc[idx, 'URL to start-up(s)'] = ''  # type: ignore
             failed += 1
         
         # Calculate progress and time estimates
@@ -344,7 +344,7 @@ def save_summarized_csv(
     # Define the required output columns in the correct order
     required_columns = [
         'filename', 'filepath', 'url', 'title', 'publication_date', 
-        'content', 'categories', 'Indicator', 'Dimension', 'Tech', 'TRL', 'URL to start-ups'
+        'content', 'categories', 'Indicator', 'Dimension', 'Tech', 'TRL', 'URL to start-up(s)'
     ]
     
     # Select only the required columns that exist in the dataframe

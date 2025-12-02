@@ -24,14 +24,6 @@ import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Optional: Gensim for keyword expansion
-try:
-    import gensim.downloader as api
-    HAS_GENSIM = True
-except ImportError:
-    api = None  # type: ignore
-    HAS_GENSIM = False
-
 # Load environment variables at the module level
 load_dotenv()
 
@@ -48,7 +40,7 @@ from schemas.datamodel import (
     CSVSummarizationHistory,
 )
 from embeddings import CSVEmbeddingProcessor
-from tests.query_tests import JSONEmbeddingProcessor
+from embeddings_processor import JSONEmbeddingProcessor
 
 # Configure logging
 logging.basicConfig(
@@ -167,6 +159,60 @@ st.markdown("""
     /* Alternative selector for sidebar border */
     .css-1d391kg, .st-emotion-cache-1d391kg {
         border-right: 2px solid #000000 !important;
+    }
+    
+    /* Make sidebar resizable with a minimum width */
+    section[data-testid="stSidebar"] {
+        min-width: 350px !important;
+        max-width: 800px !important;
+        resize: horizontal !important;
+        overflow: auto !important;
+    }
+    
+    section[data-testid="stSidebar"] > div {
+        min-width: 350px !important;
+        width: 100% !important;
+    }
+    
+    /* Auto-adjust multiselect widget to use full sidebar width */
+    section[data-testid="stSidebar"] .stMultiSelect {
+        width: 100% !important;
+    }
+    
+    /* Standardize all multiselect items to same width - fit content */
+    section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="select"] {
+        width: 100% !important;
+    }
+    
+    /* Make all tags the same size to match longest item */
+    section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] {
+        white-space: nowrap !important;
+        max-width: none !important;
+        font-size: 0.8rem !important;
+        min-width: fit-content !important;
+        width: auto !important;
+        display: inline-flex !important;
+    }
+    
+    /* Ensure tag container expands to fit all tags */
+    section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="select"] > div {
+        width: 100% !important;
+        display: flex !important;
+        flex-wrap: wrap !important;
+        gap: 4px !important;
+    }
+    
+    /* Reduce font size for multiselect items */
+    section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="select"] span {
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        font-size: 0.75rem !important;
+    }
+    
+    /* Reduce font size in dropdown options */
+    section[data-testid="stSidebar"] .stMultiSelect [role="option"] {
+        font-size: 0.75rem !important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -2242,8 +2288,8 @@ elif page == "Summarization":
                         tech_fields.append(f"Dimension: {row['Dimension']}")
                     if row.get('Tech'):
                         tech_fields.append(f"Tech: {row['Tech']}")
-                    if row.get('URL to start-ups') and str(row['URL to start-ups']) != 'N/A':
-                        tech_fields.append(f"URL to start-ups: {row['URL to start-ups']}")
+                    if row.get('URL to start-up(s)') and str(row['URL to start-up(s)']) != 'N/A':
+                        tech_fields.append(f"URL to start-up(s): {row['URL to start-up(s)']}")
                     
                     if tech_fields:
                         st.markdown(f"**Tech Intelligence:** :blue[{', '.join(tech_fields)}]")
@@ -2268,7 +2314,7 @@ elif page == "Summarization":
                         dimension = str(row.get('Dimension', ''))
                         tech = str(row.get('Tech', ''))
                         trl = str(row.get('TRL', ''))
-                        startup = str(row.get('URL to start-ups', ''))
+                        startup = str(row.get('URL to start-up(s)', ''))
                         
                         tech_intel_text = f"Indicator: {indicator}\n\n"
                         if dimension:
@@ -2278,7 +2324,7 @@ elif page == "Summarization":
                         if trl:
                             tech_intel_text += f"TRL: {trl}\n"
                         if startup and startup != 'N/A':
-                            tech_intel_text += f"URL to start-ups: {startup}\n"
+                            tech_intel_text += f"URL to start-up(s): {startup}\n"
                         
                         st.text_area(
                             "Tech Intelligence",
@@ -2691,6 +2737,10 @@ elif page == "Database":
                 
                 combined_df['source'] = combined_df['source_file'].apply(create_source_from_filename)
             
+            # Rename old 'Start-up' column to new 'URL to start-up(s)' for backward compatibility
+            if 'Start-up' in combined_df.columns:
+                combined_df = combined_df.rename(columns={'Start-up': 'URL to start-up(s)'})
+            
             return combined_df, total_rows
         return None, 0
     
@@ -2808,19 +2858,8 @@ elif page == "Database":
     search_query = st.text_input(
         "🔎 Search in database", 
         placeholder="Enter keywords (separate with commas)...",
-        help="Enter one or more keywords. Separate multiple keywords with commas. Any keyword will match (OR logic). Similar keywords will be automatically found using AI if enabled below."
+        help="Enter one or more keywords. Separate multiple keywords with commas. Any keyword will match (OR logic)."
     )
-    
-    # Keyword expansion option (always visible if gensim is available)
-    use_keyword_expansion = False
-    if HAS_GENSIM:
-        use_keyword_expansion = st.checkbox(
-            "🔍 Use AI to find similar keywords",
-            value=True,
-            help="Automatically expand your search with semantically similar keywords using word embeddings (powered by GloVe word2vec)"
-        )
-    else:
-        st.info("💡 Install 'gensim' package to enable AI-powered keyword expansion")
     
     # Apply filters
     filtered_df = combined_df.copy()
@@ -2857,52 +2896,7 @@ elif page == "Database":
                    'filename', 'file_name', 'folder', 'filepath', 'Source', 'source', 'author']
     display_columns = [col for col in filtered_df.columns if col not in exclude_cols]
     
-    # Load word2vec model for keyword expansion (cached)
-    @st.cache_resource
-    def load_word2vec_model():
-        """Load pre-trained word2vec model (cached)"""
-        if not HAS_GENSIM or api is None:
-            return None
-            
-        try:
-            # Use a smaller model for faster loading - glove-wiki-gigaword-50
-            # Alternative: 'word2vec-google-news-300' (larger, more accurate but slower)
-            model = api.load('glove-wiki-gigaword-50')
-            return model
-        except Exception as e:
-            st.warning(f"Could not load word2vec model: {e}")
-            return None
-    
-    def expand_keywords(keywords, model, top_n=10):
-        """Find similar keywords using word2vec"""
-        expanded = {}
-        for keyword in keywords:
-            # Clean the keyword (lowercase, replace spaces with underscores for multi-word)
-            clean_key = keyword.lower().replace(' ', '_')
-            similar_words = []
-            
-            try:
-                if clean_key in model:
-                    # Get most similar words
-                    similar = model.most_similar(clean_key, topn=top_n)
-                    similar_words = [word for word, score in similar if score > 0.7]  # Only high similarity
-            except:
-                # If keyword not in vocabulary, try individual words
-                words = keyword.lower().split()
-                for word in words:
-                    try:
-                        if word in model:
-                            similar = model.most_similar(word, topn=5)
-                            similar_words.extend([w for w, s in similar if s > 0.6])
-                    except:
-                        pass
-            
-            if similar_words:
-                expanded[keyword] = list(set(similar_words[:top_n]))  # Deduplicate and limit
-        
-        return expanded
-    
-    # Multi-keyword search (OR logic with optional expansion)
+    # Multi-keyword search (OR logic)
     if search_query:
         # Parse multiple keywords - split by comma only
         keywords = [k.strip() for k in search_query.split(',') if k.strip()]
@@ -2910,28 +2904,10 @@ elif page == "Database":
         if not keywords:
             keywords = [search_query.strip()]
         
-        # Expand keywords if enabled
-        all_keywords = keywords.copy()
-        expanded_keywords_dict = {}
-        
-        if use_keyword_expansion and HAS_GENSIM:
-            with st.spinner("🤖 Finding similar keywords..."):
-                model = load_word2vec_model()
-                if model is not None:
-                    expanded_keywords_dict = expand_keywords(keywords, model, top_n=5)
-                    
-                    # Add expanded keywords to search
-                    for original, similar in expanded_keywords_dict.items():
-                        all_keywords.extend(similar)
-                    
-                    # Remove duplicates while preserving order
-                    seen = set()
-                    all_keywords = [k for k in all_keywords if k.lower() not in seen and not seen.add(k.lower())]
-        
         # Apply OR logic - any keyword may match
         final_mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
 
-        for keyword in all_keywords:
+        for keyword in keywords:
             # Create a mask for this keyword across all display columns
             keyword_mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
             for col in display_columns:
@@ -2942,16 +2918,10 @@ elif page == "Database":
         filtered_df = filtered_df[final_mask]
 
         # Show which keywords are being searched
-        if expanded_keywords_dict:
-            st.success("✨ **Expanded Keywords:**")
-            for original, similar in expanded_keywords_dict.items():
-                if similar:
-                    st.caption(f"  • **{original}** → {', '.join(similar)}")
-        
         if len(keywords) > 1:
-            st.caption(f"🔍 Searching for any of: {', '.join([f'**{k}**' for k in all_keywords])} (any match)")
+            st.caption(f"🔍 Searching for any of: {', '.join([f'**{k}**' for k in keywords])} (any match)")
         else:
-            st.caption(f"🔍 Searching for: **{', '.join([f'**{k}**' for k in all_keywords])}**")
+            st.caption(f"🔍 Searching for: **{keywords[0]}**")
     
     st.info(f"Showing {len(filtered_df)} of {len(combined_df)} entries")
     
@@ -2965,19 +2935,27 @@ elif page == "Database":
     else:
         # Prepare dataframe for display - exclude specified columns
         exclude_cols = ['source_file', 'processed_date', 'content', 'file', 'file_location', 
-                       'filename', 'file_name', 'folder', 'filepath', 'Source', 'source', 'author', 'categories']
+                       'filename', 'file_name', 'folder', 'filepath', 'Source', 'source', 'author']
         display_df = filtered_df.drop(columns=[col for col in exclude_cols if col in filtered_df.columns])
         
-        # Reorder columns to put 'date' as the third column
-        if 'date' in display_df.columns:
-            # Get all columns
-            cols = display_df.columns.tolist()
-            # Remove 'date' from its current position
-            cols.remove('date')
-            # Insert 'date' at position 2 (third column, 0-indexed)
-            cols.insert(2, 'date')
-            # Reorder the dataframe
-            display_df = display_df[cols]
+        # Define desired column order
+        desired_order = [
+            'title',
+            'Indicator',  # This is the summary/indicator column
+            'publication_date',  # publication date (matches CSV column name)
+            'categories',
+            'Dimension',  # matches CSV column name
+            'Tech',  # matches CSV column name
+            'TRL',  # matches CSV column name
+            'URL to start-up(s)',  # matches CSV column name
+            'url'  # URL as the last column
+        ]
+        
+        # Reorder columns according to desired order - only include columns that exist
+        ordered_cols = [col for col in desired_order if col in display_df.columns]
+        
+        # Reorder the dataframe (don't include remaining columns - strict ordering)
+        display_df = display_df[ordered_cols]
         
         # Reset index to show row numbers starting from 1
         display_df = display_df.reset_index(drop=True)
@@ -3064,11 +3042,58 @@ elif page == "Database":
                 editable=False
             )
         
-        if 'date' in display_df.columns:
+        if 'publication_date' in display_df.columns:
             gb.configure_column(
-                'date', 
+                'publication_date', 
                 headerName='Date', 
                 width=100, 
+                enableCellTextSelection=True,
+                editable=False
+            )
+        
+        if 'categories' in display_df.columns:
+            gb.configure_column(
+                'categories', 
+                headerName='Categories', 
+                width=120, 
+                wrapText=True, 
+                enableCellTextSelection=True,
+                editable=False
+            )
+        
+        if 'Dimension' in display_df.columns:
+            gb.configure_column(
+                'Dimension', 
+                headerName='Dimension', 
+                width=100, 
+                enableCellTextSelection=True,
+                editable=False
+            )
+        
+        if 'Tech' in display_df.columns:
+            gb.configure_column(
+                'Tech', 
+                headerName='Technology', 
+                width=100, 
+                enableCellTextSelection=True,
+                editable=False
+            )
+        
+        if 'TRL' in display_df.columns:
+            gb.configure_column(
+                'TRL', 
+                headerName='TRL Level', 
+                width=80, 
+                enableCellTextSelection=True,
+                editable=False
+            )
+        
+        if 'Start-up' in display_df.columns:
+            gb.configure_column(
+                'Start-up', 
+                headerName='URL to Start-up', 
+                width=120, 
+                wrapText=True, 
                 enableCellTextSelection=True,
                 editable=False
             )
@@ -3118,6 +3143,31 @@ elif page == "Database":
     # Export options
     st.subheader("📥 Export Database")
     
+    # Define column order for exports (same as display)
+    desired_order = [
+        'title',
+        'Indicator',  # summary/indicator column
+        'publication_date',  # publication date (matches CSV column name)
+        'categories',
+        'Dimension',  # matches CSV column name
+        'Tech',  # matches CSV column name
+        'TRL',  # matches CSV column name
+        'URL to start-up(s)',  # matches CSV column name
+        'url'  # URL as the last column
+    ]
+    
+    # Helper function to reorder columns
+    def reorder_export_columns(df):
+        """Reorder dataframe columns according to desired order, excluding unwanted columns"""
+        # Exclude columns that shouldn't be in exports
+        exclude_cols = ['source_file', 'processed_date', 'content', 'file', 'file_location', 
+                       'filename', 'file_name', 'folder', 'filepath', 'Source', 'source', 'author']
+        df_clean = df.drop(columns=[col for col in exclude_cols if col in df.columns])
+        
+        # Get columns that exist in desired order - strict ordering, no remaining columns
+        ordered_cols = [col for col in desired_order if col in df_clean.columns]
+        return df_clean[ordered_cols]
+    
     # CSV & JSON exports
     st.markdown("**CSV & JSON Formats**")
     col1, col2, col3, col4 = st.columns(4)
@@ -3125,7 +3175,8 @@ elif page == "Database":
     with col1:
         # Export filtered results as CSV
         if len(filtered_df) > 0:
-            csv_export = filtered_df.to_csv(index=False).encode('utf-8')
+            filtered_export = reorder_export_columns(filtered_df.copy())
+            csv_export = filtered_export.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📄 Filtered CSV",
                 data=csv_export,
@@ -3137,8 +3188,9 @@ elif page == "Database":
     with col2:
         # Export filtered results as JSON
         if len(filtered_df) > 0:
+            filtered_export = reorder_export_columns(filtered_df.copy())
             # Convert DataFrame to JSON (orient='records' creates array of objects)
-            json_export = filtered_df.to_json(orient='records', indent=2, force_ascii=False).encode('utf-8')
+            json_export = filtered_export.to_json(orient='records', indent=2, force_ascii=False).encode('utf-8')
             st.download_button(
                 label="📋 Filtered JSON",
                 data=json_export,
@@ -3149,7 +3201,8 @@ elif page == "Database":
     
     with col3:
         # Export all data as CSV
-        all_csv = combined_df.to_csv(index=False).encode('utf-8')
+        all_export = reorder_export_columns(combined_df.copy())
+        all_csv = all_export.to_csv(index=False).encode('utf-8')
         st.download_button(
             label="📄 Complete CSV",
             data=all_csv,
@@ -3160,7 +3213,8 @@ elif page == "Database":
     
     with col4:
         # Export all data as JSON
-        all_json = combined_df.to_json(orient='records', indent=2, force_ascii=False).encode('utf-8')
+        all_export = reorder_export_columns(combined_df.copy())
+        all_json = all_export.to_json(orient='records', indent=2, force_ascii=False).encode('utf-8')
         st.download_button(
             label="📋 Complete JSON",
             data=all_json,
@@ -3178,8 +3232,8 @@ elif page == "Database":
         from io import BytesIO
         output = BytesIO()
         
-        # Prepare dataframes for export
-        export_all_df = combined_df.copy()
+        # Prepare dataframes for export with reordered columns
+        export_all_df = reorder_export_columns(combined_df.copy())
         if 'categories' in export_all_df.columns:
             export_all_df['categories'] = export_all_df['categories'].apply(
                 lambda x: '; '.join(x) if isinstance(x, list) else x
@@ -3188,7 +3242,7 @@ elif page == "Database":
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             export_all_df.to_excel(writer, index=False, sheet_name='All Data')
             if len(filtered_df) > 0 and len(filtered_df) < len(combined_df):
-                export_filtered_df = filtered_df.copy()
+                export_filtered_df = reorder_export_columns(filtered_df.copy())
                 if 'categories' in export_filtered_df.columns:
                     export_filtered_df['categories'] = export_filtered_df['categories'].apply(
                         lambda x: '; '.join(x) if isinstance(x, list) else x
@@ -3232,9 +3286,6 @@ elif page == "Chatbot":
         st.info("💡 The chatbot needs processed JSON data to answer your questions.")
         st.stop()
     
-    # File selection for embeddings
-    st.markdown("#### 📁 Select Data Sources")
-    
     # Helper function for source name extraction
     def extract_source_name_from_filename(filename: str) -> str:
         """
@@ -3261,6 +3312,31 @@ elif page == "Chatbot":
         
         return stem
     
+    def extract_date_from_filename(filename: str) -> str:
+        """
+        Extract and format date from filename.
+        
+        Args:
+            filename: Filename like "techcrunch_com_20251127.json"
+            
+        Returns:
+            Formatted date like "2025-11-27" or empty string if not found
+        """
+        from pathlib import Path
+        import re
+        
+        # Remove .json extension
+        stem = Path(filename).stem
+        
+        # Look for date pattern YYYYMMDD
+        date_match = re.search(r'_(\d{8})$', stem)
+        if date_match:
+            date_str = date_match.group(1)
+            # Format as YYYY-MM-DD
+            return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+        
+        return ""
+    
     # Get available JSON files with metadata
     available_files = []
     for json_file in json_files:
@@ -3268,13 +3344,15 @@ elif page == "Chatbot":
             with open(json_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 if data:  # Check if file has content
-                    # Extract source name from filename using same logic as JSONEmbeddingProcessor
+                    # Extract source name and date from filename
                     filename = json_file.name
                     source_name = extract_source_name_from_filename(filename)
+                    date_str = extract_date_from_filename(filename)
                     
                     available_files.append({
                         'filename': filename,
                         'source_name': source_name,
+                        'date': date_str,
                         'path': json_file,
                         'count': len(data)
                     })
@@ -3285,9 +3363,22 @@ elif page == "Chatbot":
         st.error("No valid JSON files found with content.")
         st.stop()
     
-    # Create options for multiselect
-    file_options = [f"{f['source_name']} ({f['count']} articles)" for f in available_files]
-    file_options_dict = {f"{f['source_name']} ({f['count']} articles)": f for f in available_files}
+    # Create options for multiselect with compact format for sidebar display
+    # Format: <Source> <date>
+    file_options = []
+    file_options_dict = {}
+    
+    for f in available_files:
+        # Compact format: "Techcrunch 11/28"
+        date_parts = f['date'].split('-') if f['date'] else ['', '', '']
+        if len(date_parts) == 3:
+            short_date = f"{date_parts[1]}/{date_parts[2]}"  # MM/DD
+        else:
+            short_date = ""
+        
+        compact_label = f"{f['source_name']} {short_date}"
+        file_options.append(compact_label)
+        file_options_dict[compact_label] = f
     
     # Default to all files if none selected, or filter out invalid cached selections
     if 'selected_files' not in st.session_state:
@@ -3298,23 +3389,6 @@ elif page == "Chatbot":
         # If all selections were invalid, default to all files
         if not st.session_state.selected_files:
             st.session_state.selected_files = file_options
-    
-    selected_options = st.multiselect(
-        "Choose which data sources to include:",
-        options=file_options,
-        default=st.session_state.selected_files,
-        help="Select the JSON files you want to use for the chatbot. Only selected sources will be included in searches."
-    )
-    
-    # Update session state
-    st.session_state.selected_files = selected_options
-    
-    # Get selected file objects
-    selected_files = [file_options_dict[opt] for opt in selected_options] if selected_options else []
-    
-    if not selected_files:
-        st.warning("Please select at least one data source.")
-        st.stop()
     
     # Helper functions for S3 embeddings management
     def upload_embeddings_to_s3(processor, embedding_indexes):
@@ -3352,15 +3426,50 @@ elif page == "Chatbot":
     
     # Sidebar controls
     with st.sidebar:
-        st.markdown("### 🗄️ Database Status")
+        st.markdown("### � Select Data Sources")
+        
+        # File selection widget in sidebar
+        selected_options = st.multiselect(
+            "Choose data sources:",
+            options=file_options,
+            default=st.session_state.selected_files,
+            help="Format: Source MM/DD (article count). Example: Techcrunch 11/28 (50)",
+            label_visibility="collapsed"
+        )
+        
+        # Update session state
+        st.session_state.selected_files = selected_options
+        
+        # Get selected file objects
+        selected_files = [file_options_dict[opt] for opt in selected_options] if selected_options else []
+        
+        if not selected_files:
+            st.warning("Please select at least one data source.")
+            st.stop()
+        
+        st.divider()
+        st.markdown("### �🗄️ Database Status")
         
         # Check if embeddings exist in S3 for selected files
         s3_available_indexes = []
+        s3_index_mapping = {}  # Map source_name to full index name with date
         try:
             from aws_storage import get_storage
             s3_storage = get_storage()
             s3_files = s3_storage.list_files(prefix="rag_embeddings/", suffix=".pkl")
-            s3_available_indexes = [f.replace("rag_embeddings/", "").replace("_embeddings.pkl", "") for f in s3_files]
+            
+            # Parse S3 filenames to extract source name and create mapping
+            for s3_file in s3_files:
+                # Extract index name from path: "rag_embeddings/Techcrunch_20251128_embeddings.pkl"
+                index_name = s3_file.replace("rag_embeddings/", "").replace(".pkl", "")
+                
+                # Extract source name (first part before date)
+                import re
+                match = re.match(r'^([A-Za-z\-]+)', index_name)
+                if match:
+                    source_name = match.group(1)
+                    s3_available_indexes.append(source_name)
+                    s3_index_mapping[source_name] = index_name
         except:
             pass
         
@@ -3396,22 +3505,25 @@ elif page == "Chatbot":
             if st.button("☁️ Load Selected from S3", use_container_width=True, type="secondary"):
                 with st.spinner("Downloading selected embeddings from S3..."):
                     try:
-                        from tests.query_tests import JSONEmbeddingProcessor
+                        from embeddings_processor import JSONEmbeddingProcessor
                         processor = JSONEmbeddingProcessor()
                         
                         embedding_indexes = {}
                         loaded_count = 0
                         
                         for file_info in selected_files:
-                            source_key = file_info['source_name']
-                            if source_key in s3_available_indexes:
+                            source_name = file_info['source_name']
+                            if source_name in s3_index_mapping:
                                 try:
-                                    embedding_index = processor.download_index_from_s3(f"{source_key}_embeddings")
+                                    # Use the full index name with date from the mapping
+                                    full_index_name = s3_index_mapping[source_name]
+                                    embedding_index = processor.download_index_from_s3(full_index_name)
                                     if embedding_index:
-                                        embedding_indexes[file_info['source_name']] = embedding_index
+                                        # Store with a friendly key (source_name for backward compatibility)
+                                        embedding_indexes[source_name] = embedding_index
                                         loaded_count += 1
                                 except Exception as e:
-                                    st.warning(f"Failed to download {file_info['source_name']}: {e}")
+                                    st.warning(f"Failed to download {source_name}: {e}")
                         
                         if embedding_indexes:
                             st.session_state.chat_processor = processor
@@ -3430,7 +3542,7 @@ elif page == "Chatbot":
         if st.button("🔄 Build Selected Embeddings", use_container_width=True, type="primary"):
             with st.spinner("Building embeddings for selected files..."):
                 try:
-                    from tests.query_tests import JSONEmbeddingProcessor
+                    from embeddings_processor import JSONEmbeddingProcessor
                     
                     # Initialize processor with same parameters as rebuild_embeddings.py
                     processor = JSONEmbeddingProcessor(
@@ -3497,6 +3609,19 @@ elif page == "Chatbot":
         
         st.divider()
         
+        # Retrieval settings
+        st.markdown("### ⚙️ Retrieval Settings")
+        num_results = st.slider(
+            "Number of documents to retrieve",
+            min_value=5,
+            max_value=30,
+            value=10,
+            step=1,
+            help="Adjust how many relevant documents are retrieved and used to generate the response"
+        )
+        
+        st.divider()
+        
         # Clear chat history
         if st.button("🗑️ Clear Chat History", use_container_width=True):
             st.session_state.chat_messages = []
@@ -3541,16 +3666,32 @@ elif page == "Chatbot":
             if "sources" in message and message["sources"]:
                 with st.expander("📚 Sources"):
                     for i, source in enumerate(message["sources"], 1):
-                        st.markdown(f"**{i}. [{source['title']}]({source['url']})**")
+                        # Use URL as title if title is None or empty
+                        title = source.get('title', 'Untitled')
+                        if not title or title.lower() in ['none', 'untitled', 'n/a']:
+                            title = source.get('url', 'Untitled')
+                        
+                        st.markdown(f"**{i}. [{title}]({source['url']})**")
                         st.caption(f"📅 {source.get('publication_date', 'N/A')} | 🏷️ {source.get('categories', 'N/A')}")
                         if source.get('source'):
                             st.caption(f"📺 Source: {source['source']}")
                         if source.get('tech'):
                             st.caption(f"💡 Tech: {source['tech']} | TRL: {source.get('trl', 'N/A')} | Dim: {source.get('dimension', 'N/A')}")
+                        
+                        # Display Indicator/Summary
+                        indicator = source.get('indicator', '')
+                        if indicator and indicator != 'N/A':
+                            st.markdown(f"**📝 Summary:** {indicator}")
+                        
+                        # Display URL to start-up(s)
+                        startup = source.get('startup', '')
+                        if startup and startup != 'N/A' and startup:
+                            st.caption(f"🚀 URL to start-up(s): {startup}")
+                        
                         st.divider()
     
     # Chat input
-    if prompt := st.chat_input("Ask about technology intelligence... (try: 'latest AI articles', 'TechCrunch hydrogen news', 'TRL 8 technologies')"):
+    if prompt := st.chat_input("Chat with the data (try: 'latest AI articles', 'TechCrunch hydrogen news', 'TRL 8 technologies')"):
         # Add user message to chat
         st.session_state.chat_messages.append({"role": "user", "content": prompt})
         
@@ -3579,25 +3720,30 @@ elif page == "Chatbot":
                         sources = ["techcrunch", "carbonherald", "hydrogen-central", "interestingengineering", "canarymedia", "bioenergy-news", "pv-magazine"]
                         for source in sources:
                             if source in query_lower or f"from {source}" in query_lower:
-                                filters["source"] = source.replace("-", "").replace("_", "")
-                                break
-                        
-                        # Dimension filters
-                        dimensions = ["energy", "environment", "technology", "climate", "sustainability", "renewable", "carbon", "hydrogen", "solar", "wind"]
-                        for dim in dimensions:
-                            if dim in query_lower:
-                                filters["dimension"] = dim
-                                break
-                        
-                        # Tech filters
-                        tech_terms = ["ai", "artificial intelligence", "machine learning", "blockchain", "iot", "robotics", "biotech", "nanotech"]
-                        for tech in tech_terms:
-                            if tech in query_lower:
-                                filters["tech"] = tech
+                                # Keep the original source name (preserve hyphens) for matching
+                                filters["source"] = source
                                 break
                         
                         # TRL filters (Technology Readiness Level)
-                        if "trl" in query_lower:
+                        # First check for research stage keywords that map to TRL ranges
+                        trl_stage_patterns = {
+                            r'\b(basic|fundamental)\s+research\b': '1-3',
+                            r'\bproof\s+of\s+concept\b': '1-3',
+                            r'\blaboratory\s+(research|validation|testing|demonstration)\b': '1-5',
+                            r'\blab\s+(testing|validation|scale)\b': '4-5',
+                            r'\bprototype\s+(testing|development)\b': '6-7',
+                            r'\bpilot\s+(project|testing|scale)\b': '6-7',
+                            r'\b(commercial|deployed|operational)\s+(system|deployment|scale)\b': '8-9',
+                            r'\bmarket\s+ready\b': '8-9'
+                        }
+                        
+                        for pattern, trl_range in trl_stage_patterns.items():
+                            if re.search(pattern, query_lower):
+                                filters["trl_range"] = trl_range
+                                break
+                        
+                        # Then check for explicit TRL numbers (only if no stage pattern matched)
+                        if "trl_range" not in filters and "trl" in query_lower:
                             for i in range(1, 10):
                                 if f"trl {i}" in query_lower or f"trl{i}" in query_lower:
                                     filters["trl"] = str(i)
@@ -3652,7 +3798,22 @@ elif page == "Chatbot":
                         
                         # Relative date filters
                         if not date_filters:
-                            if "latest" in query_lower or "recent" in query_lower or "new" in query_lower:
+                            # Pattern for "last X months/weeks/days"
+                            last_period_match = re.search(r'last\s+(\d+)\s+(month|week|day)s?', query_lower)
+                            if last_period_match:
+                                num = int(last_period_match.group(1))
+                                period = last_period_match.group(2)
+                                
+                                if period == "month":
+                                    days_ago = num * 30
+                                elif period == "week":
+                                    days_ago = num * 7
+                                else:  # day
+                                    days_ago = num
+                                
+                                date_after = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+                                date_filters['date_after'] = date_after
+                            elif "latest" in query_lower or "recent" in query_lower or "new" in query_lower:
                                 # Get recent articles (last 2 months / 60 days)
                                 two_months_ago = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
                                 date_filters['date_after'] = two_months_ago
@@ -3669,32 +3830,50 @@ elif page == "Chatbot":
                     # Parse query for metadata filters
                     metadata_filters, date_filters = parse_query_for_filters(prompt)
                     
+                    # Extract source filter separately (since it's not in embeddings metadata)
+                    source_filter = metadata_filters.pop("source", None) if metadata_filters else None
+                    
                     # Show debug info about detected filters
-                    if metadata_filters or date_filters:
+                    if metadata_filters or date_filters or source_filter:
                         filter_info = []
+                        if source_filter:
+                            filter_info.append(f"source={source_filter}")
                         if metadata_filters:
-                            filter_info.append(f"**Metadata filters:** {', '.join([f'{k}={v}' for k, v in metadata_filters.items()])}")
+                            # Handle TRL range separately for better display
+                            display_filters = {}
+                            for k, v in metadata_filters.items():
+                                if k == 'trl_range':
+                                    filter_info.append(f"TRL range: {v}")
+                                else:
+                                    display_filters[k] = v
+                            
+                            if display_filters:
+                                filter_info.append(f"{', '.join([f'{k}={v}' for k, v in display_filters.items()])}")
                         if date_filters:
                             if 'year' in date_filters and 'month' in date_filters:
                                 month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", 
                                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-                                filter_info.append(f"**Date filter:** {month_names[date_filters['month']]} {date_filters['year']}")
+                                filter_info.append(f"Date filter: {month_names[date_filters['month']]} {date_filters['year']}")
                             elif 'year' in date_filters:
-                                filter_info.append(f"**Date filter:** Year {date_filters['year']}")
+                                filter_info.append(f"Date filter: Year {date_filters['year']}")
                             elif 'date_after' in date_filters:
-                                filter_info.append(f"**Date filter:** After {date_filters['date_after']}")
+                                filter_info.append(f"Date filter: After {date_filters['date_after']}")
                         
-                        st.info("🔍 " + " | ".join(filter_info))
+                        st.info("🔍 Metadata filters: " + " | ".join(filter_info))
                     
                     # Query across all embedding indexes
                     all_results = []
                     processor = st.session_state.chat_processor
                     embedding_indexes = st.session_state.embedding_indexes
                     
-                    # Get more results initially if we need to filter by date
-                    initial_top_k = 20 if date_filters else 5
+                    # Get more results initially if we need to filter by date or source
+                    # Use num_results * 2 for filtering scenarios to ensure we have enough after filtering
+                    initial_top_k = num_results * 2 if (date_filters or source_filter) else num_results
                     
-                    for source_name, embedding_index in embedding_indexes.items():
+                    # Query all sources (we'll filter by URL domain later)
+                    sources_to_query = list(embedding_indexes.items())
+                    
+                    for source_name, embedding_index in sources_to_query:
                         try:
                             results = processor.query_similar(
                                 embedding_index,
@@ -3712,11 +3891,35 @@ elif page == "Chatbot":
                             st.warning(f"Error querying {source_name}: {e}")
                             continue
                     
+                    # Apply source filtering by URL domain if specified
+                    if source_filter and all_results:
+                        filtered_results = []
+                        debug_info = {"before_filter": len(all_results), "after_filter": 0, "filtered_out": 0}
+                        
+                        for result in all_results:
+                            url = result['metadata'].get('url', '').lower()
+                            # Check if the source filter appears in the URL domain
+                            if source_filter in url:
+                                filtered_results.append(result)
+                            else:
+                                debug_info["filtered_out"] += 1
+                        
+                        debug_info["after_filter"] = len(filtered_results)
+                        all_results = filtered_results
+                        
+                        # Show debug info
+                        if debug_info["after_filter"] > 0:
+                            st.info(f"🔍 Source filter applied: {debug_info['before_filter']} results → {debug_info['after_filter']} results from '{source_filter}' domain (removed {debug_info['filtered_out']} from other sources)")
+                        else:
+                            st.warning(f"⚠️ No results found with '{source_filter}' in the URL domain.")
+                    
                     # Apply date filtering on results if specified
                     if date_filters and all_results:
                         from datetime import datetime
                         
                         filtered_results = []
+                        debug_info = {"before_filter": len(all_results), "after_filter": 0, "filtered_out": 0}
+                        
                         for result in all_results:
                             pub_date = result['metadata'].get('publication_date', '')
                             if not pub_date:
@@ -3733,11 +3936,13 @@ elif page == "Chatbot":
                                 if 'date_after' in date_filters:
                                     after_date = datetime.strptime(date_filters['date_after'], '%Y-%m-%d')
                                     if pub_date_obj < after_date:
+                                        debug_info["filtered_out"] += 1
                                         continue
                                 
                                 if 'date_before' in date_filters:
                                     before_date = datetime.strptime(date_filters['date_before'], '%Y-%m-%d')
                                     if pub_date_obj >= before_date:
+                                        debug_info["filtered_out"] += 1
                                         continue
                                 
                                 filtered_results.append(result)
@@ -3746,15 +3951,155 @@ elif page == "Chatbot":
                                 # Skip results with invalid dates
                                 continue
                         
+                        debug_info["after_filter"] = len(filtered_results)
                         all_results = filtered_results
+                        
+                        # Show debug info
+                        if 'date_after' in date_filters:
+                            st.info(f"📅 Date filter applied: {debug_info['before_filter']} results → {debug_info['after_filter']} results after filtering (removed {debug_info['filtered_out']} old articles)")
                     
-                    # Sort all results by score and take top 5
+                    # Apply TRL range filtering if specified
+                    if metadata_filters and 'trl_range' in metadata_filters and all_results:
+                        trl_range = metadata_filters.pop('trl_range')
+                        filtered_results = []
+                        debug_info = {"before_filter": len(all_results), "after_filter": 0, "filtered_out": 0}
+                        
+                        # Parse TRL range (e.g., "1-3", "4-5", "6-7", "8-9")
+                        trl_min, trl_max = map(int, trl_range.split('-'))
+                        
+                        for result in all_results:
+                            trl_str = result['metadata'].get('trl', '')
+                            if not trl_str:
+                                continue
+                            
+                            try:
+                                # Parse TRL value (handle both int and float)
+                                trl_value = int(float(str(trl_str).strip()))
+                                
+                                # Check if TRL is within range
+                                if trl_min <= trl_value <= trl_max:
+                                    filtered_results.append(result)
+                                else:
+                                    debug_info["filtered_out"] += 1
+                                    
+                            except (ValueError, AttributeError):
+                                # Skip results with invalid TRL values
+                                continue
+                        
+                        debug_info["after_filter"] = len(filtered_results)
+                        all_results = filtered_results
+                        
+                        # Show debug info
+                        st.info(f"🔬 TRL filter applied (TRL {trl_range}): {debug_info['before_filter']} results → {debug_info['after_filter']} results after filtering (removed {debug_info['filtered_out']} articles)")
+                    
+                    # Sort all results by score and take top N (based on slider)
                     all_results.sort(key=lambda x: x['score'], reverse=True)
-                    results = all_results[:5]
+                    results = all_results[:num_results]
+                    
+                    # Debug: Show how many results were found
+                    if source_filter or date_filters:
+                        st.caption(f"📊 Found {len(all_results)} matching articles, showing top {len(results)}")
+                    
+                    # If no results found, try relaxing filters automatically
+                    if not results and (metadata_filters.get('trl_range') or date_filters):
+                        st.warning("⚠️ No results found with current filters. Attempting to relax filters...")
+                        
+                        # Strategy: Remove TRL range filter (most restrictive for research queries)
+                        relaxed = False
+                        
+                        # Try removing TRL range first
+                        if 'trl_range' in metadata_filters:
+                            st.info("🔄 Retrying without TRL range filter...")
+                            metadata_filters.pop('trl_range')
+                            # Re-run the query without TRL filtering
+                            all_results_backup = []
+                            for source_name, embedding_index in sources_to_query:
+                                try:
+                                    results_retry = processor.query_similar(
+                                        embedding_index,
+                                        query_text=prompt,
+                                        top_k=num_results * 2,  # Get more results for filtering
+                                        filter_metadata=metadata_filters if metadata_filters else None
+                                    )
+                                    for result in results_retry:
+                                        result['metadata']['source'] = source_name
+                                    all_results_backup.extend(results_retry)
+                                except Exception:
+                                    continue
+                            
+                            # Re-apply date filters only (no tech filter)
+                            if date_filters:
+                                from datetime import datetime
+                                filtered = []
+                                for result in all_results_backup:
+                                    pub_date = result['metadata'].get('publication_date', '')
+                                    if pub_date:
+                                        try:
+                                            if 'T' in pub_date:
+                                                pub_date_obj = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+                                            else:
+                                                pub_date_obj = datetime.strptime(pub_date[:10], '%Y-%m-%d')
+                                            
+                                            if 'date_after' in date_filters:
+                                                after_date = datetime.strptime(date_filters['date_after'], '%Y-%m-%d')
+                                                if pub_date_obj < after_date:
+                                                    continue
+                                            if 'date_before' in date_filters:
+                                                before_date = datetime.strptime(date_filters['date_before'], '%Y-%m-%d')
+                                                if pub_date_obj >= before_date:
+                                                    continue
+                                            filtered.append(result)
+                                        except:
+                                            continue
+                                all_results_backup = filtered
+                            
+                            if all_results_backup:
+                                all_results_backup.sort(key=lambda x: x['score'], reverse=True)
+                                results = all_results_backup[:num_results]
+                                st.success(f"✅ Found {len(results)} results after relaxing TRL filter")
+                                relaxed = True
                     
                     # Extract relevant information
                     sources = []
                     context_texts = []
+                    
+                    if not results:
+                        # Semantic fallback: retrieve based on pure relevance without metadata filters
+                        st.warning("⚠️ No articles found with metadata filters. Falling back to semantic search...")
+                        st.info("🔍 Searching for semantically relevant content in the knowledge base...")
+                        
+                        # Perform semantic search without any filters
+                        fallback_results = []
+                        for source_name, embedding_index in sources_to_query:
+                            try:
+                                semantic_results = processor.query_similar(
+                                    embedding_index,
+                                    query_text=prompt,
+                                    top_k=num_results * 2,  # Get more results for better coverage
+                                    filter_metadata=None  # No metadata filtering
+                                )
+                                for result in semantic_results:
+                                    result['metadata']['source'] = source_name
+                                fallback_results.extend(semantic_results)
+                            except Exception as e:
+                                logging.warning(f"Error in semantic fallback for {source_name}: {e}")
+                                continue
+                        
+                        if fallback_results:
+                            # Sort by relevance score and take top N (based on slider)
+                            fallback_results.sort(key=lambda x: x['score'], reverse=True)
+                            results = fallback_results[:num_results]
+                            
+                            st.success(f"✅ Found {len(results)} semantically relevant articles (metadata filters removed)")
+                            st.caption("💡 Results are based on semantic relevance to your query, not metadata filters")
+                        else:
+                            # Absolute fallback - no results at all
+                            error_msg = "No articles found in the knowledge base."
+                            if source_filter:
+                                error_msg += f" (Source filter: {source_filter})"
+                            st.error(error_msg)
+                            st.info("💡 Try:\n- Checking if data from that source is loaded\n- Using different keywords\n- Rebuilding embeddings if the knowledge base was recently updated")
+                            st.stop()
                     
                     if results:
                         for result in results:
@@ -3781,7 +4126,7 @@ elif page == "Chatbot":
                     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url="https://api.openai.com/v1")
                     
                     # Create system prompt with context
-                    current_date = datetime.now().strftime("%Y-%m-%d")
+                    current_date = datetime.now().strftime("%B %d, %Y")  # e.g., "December 01, 2025"
                     
                     # Add date filter info to help LLM understand the query context
                     date_context = ""
@@ -3799,7 +4144,9 @@ elif page == "Chatbot":
                     system_prompt = f"""You are an AI research assistant specialized in technology intelligence and innovation analysis. 
 You have access to a knowledge base of articles about emerging technologies, startups, carbon markets, and clean energy from various sources.
 
-Today is {current_date}.{date_context}
+**CURRENT DATE: {current_date}**
+
+When interpreting dates in the provided sources, always reference them relative to the current date above.{date_context}
 
 Use the provided context to answer questions accurately and comprehensively. 
 When answering analytical questions (e.g., "what technologies are mentioned most", "trending topics", "most discussed"):
@@ -3811,10 +4158,18 @@ When answering analytical questions (e.g., "what technologies are mentioned most
 
 If the context doesn't contain relevant information, say so clearly.
 
-CRITICAL: You MUST accurately cite all your outputs with your sources using markdown hyperlink format when referencing information. 
-Each source has a title and URL. Use the format: [Source Title](URL)
-For example: 'According to [TechCrunch Article](https://techcrunch.com/article), the technology...'
-Always include source citations with hyperlinks when referencing specific information from the context.
+CRITICAL CITATION RULES:
+You MUST accurately cite all your outputs with your sources using markdown hyperlink format when referencing information.
+
+IMPORTANT: 
+1. The user message contains a "CITATION GUIDE" section with exact URLs you MUST use
+2. ONLY use URLs that are explicitly provided in that Citation Guide
+3. NEVER create, modify, shorten, or guess URLs - use them EXACTLY as provided
+4. Format: [Source Title](EXACT_URL_FROM_CITATION_GUIDE)
+5. If a source has no valid URL in the Citation Guide, reference it by title only without a hyperlink
+
+Example of correct citation: 'According to [TechCrunch Article](https://techcrunch.com/2024/11/15/full-article-url), the technology...'
+The URL must be copied EXACTLY from the Citation Guide - do not modify it in any way.
 
 The knowledge base includes articles from sources like TechCrunch, Carbon Herald, Hydrogen Central, etc., with metadata about:
 - Technology areas (AI, renewable energy, carbon tech, etc.)
@@ -3828,12 +4183,17 @@ The knowledge base includes articles from sources like TechCrunch, Carbon Herald
                     # Create source information for citations
                     source_info = []
                     metadata_summary = []
+                    valid_sources = []  # Track sources with valid URLs
+                    
                     for i, src in enumerate(sources, 1):
                         title = src.get('title', f'Source {i}')
                         url = src.get('url', '')
                         pub_date = src.get('publication_date', 'Unknown date')
                         tech = src.get('tech', 'N/A')
                         dimension = src.get('dimension', 'N/A')
+                        
+                        # Validate URL - must start with http:// or https://
+                        is_valid_url = url and (url.startswith('http://') or url.startswith('https://'))
                         
                         # Format publication date
                         if pub_date and pub_date != 'Unknown date':
@@ -3846,37 +4206,48 @@ The knowledge base includes articles from sources like TechCrunch, Carbon Herald
                             except:
                                 pass
                         
-                        if url:
-                            source_info.append(f"Source {i}: [{title}]({url})")
-                            metadata_summary.append(f"Source {i}: Published {pub_date}, Tech: {tech}, Dimension: {dimension}")
+                        if is_valid_url:
+                            # Create a clearer format for the model
+                            source_info.append(f"**Source {i}**\n  - Title: {title}\n  - URL: {url}\n  - Published: {pub_date}")
+                            metadata_summary.append(f"Source {i}: Tech: {tech}, Dimension: {dimension}")
+                            valid_sources.append((i, title, url))
                         else:
-                            source_info.append(f"Source {i}: {title}")
-                            metadata_summary.append(f"Source {i}: Published {pub_date}, Tech: {tech}, Dimension: {dimension}")
+                            # Skip sources without valid URLs
+                            source_info.append(f"**Source {i}**\n  - Title: {title}\n  - URL: Not available\n  - Published: {pub_date}")
+                            metadata_summary.append(f"Source {i}: Tech: {tech}, Dimension: {dimension}")
                     
-                    sources_text = "\n".join(source_info)
+                    sources_text = "\n\n".join(source_info)
                     metadata_text = "\n".join(metadata_summary)
+                    
+                    # Create a reference list of valid citations for the model
+                    citation_guide = "\n".join([f"Source {i}: Use the format [{title}]({url})" for i, title, url in valid_sources]) if valid_sources else "No sources with valid URLs available."
                     
                     user_prompt = f"""Context information is below.
 ---------------------
 {context}
 ---------------------
-Available sources for citation:
+
+AVAILABLE SOURCES WITH URLS:
 {sources_text}
+
+CITATION GUIDE - Use EXACTLY these URLs when citing sources:
+{citation_guide}
 
 Source Metadata (for analysis):
 {metadata_text}
 
-Given the context information and not prior knowledge, answer the question. 
-You MUST accurately cite all your outputs with your sources using markdown hyperlink format: [Source Title](URL). 
-Each source has a title and URL that you should use for citations.
-For example: 'According to [TechCrunch Article](https://techcrunch.com/article), the technology...'
-Always include source citations with hyperlinks when referencing information.
+CRITICAL CITATION INSTRUCTIONS:
+- You MUST cite information using the EXACT URLs provided above
+- Use the format: [Source Title](URL) where URL is taken EXACTLY from the "Citation Guide" above
+- NEVER modify, shorten, or create your own URLs
+- ONLY use the URLs explicitly listed in the Citation Guide
+- If a source doesn't have a valid URL in the guide, reference it by title only without a link
 
 For analytical questions about trends, frequencies, or patterns:
 - Analyze ALL provided sources
 - Count mentions across different articles
 - Note publication dates to verify they match the requested timeframe
-- Provide specific examples with citations
+- Provide specific examples with citations using the EXACT URLs above
 
 Question: {prompt}
 Answer: """
@@ -3906,8 +4277,23 @@ Answer: """
                     # Show sources
                     if sources:
                         with st.expander("📚 Sources (Database View)"):
+                            # Validate URLs and show warning if needed
+                            invalid_urls = []
                             for i, source in enumerate(sources, 1):
-                                st.markdown(f"**{i}. [{source['title']}]({source['url']})**")
+                                url = source.get('url', '')
+                                if not url or not (url.startswith('http://') or url.startswith('https://')):
+                                    invalid_urls.append(f"Source {i}: {url or 'No URL'}")
+                            
+                            if invalid_urls:
+                                st.warning(f"⚠️ **URL Validation Warning:** {len(invalid_urls)} source(s) have invalid or missing URLs. These sources cannot be cited with hyperlinks.\n\n" + "\n".join(invalid_urls))
+                            
+                            for i, source in enumerate(sources, 1):
+                                # Use URL as title if title is None or empty
+                                title = source.get('title', 'Untitled')
+                                if not title or title.lower() in ['none', 'untitled', 'n/a']:
+                                    title = source.get('url', 'Untitled')
+                                
+                                st.markdown(f"**{i}. [{title}]({source['url']})**")
                                 
                                 # Display all fields in a structured database-like format
                                 col1, col2 = st.columns([1, 3])
@@ -3971,13 +4357,13 @@ elif page == "About":
 
     **3. LLM Extraction**
     - **Structured Metadata** - AI extracts title, summary, author, publication date
-    - **Tech Intelligence** - Dimension, Tech, TRL, URL to start-ups classification
+    - **Tech Intelligence** - Dimension, Tech, TRL, URL to start-up(s) classification
     - **Smart Filtering** - Auto-removes empty content and dates >2 years old
     - **Dual Format** - Outputs both CSV and JSON to processed_data folder
     - **S3 Upload** - Both formats automatically uploaded to cloud storage
 
     **4. Summarization**
-    - **Tech-Intel Analysis** - AI generates Indicator, Dimension, Tech, TRL, URL to start-ups fields
+    - **Tech-Intel Analysis** - AI generates Indicator, Dimension, Tech, TRL, URL to start-up(s) fields
     - **Auto-save** - Files automatically saved and uploaded to S3 after completion
     - **Processing History** - Track all processed files with metadata
     - **Preview Mode** - View first 5 entries with original vs analyzed content
