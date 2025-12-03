@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  ti-tool:
+    build: .
+    container_name: ti-tool-app
+    ports:
+      - "8501:8501"
+    environment:
+      # LLM Provider Configuration
+      - LLM_PROVIDER=azure
+      - EMBEDDING_PROVIDER=azure
+      
+      # Azure OpenAI Configuration
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION}
+      - AZURE_OPENAI_MODEL_NAME=${AZURE_OPENAI_MODEL_NAME}
+      - AZURE_OPENAI_EMBEDDING_API_KEY=${AZURE_OPENAI_EMBEDDING_API_KEY}
+      - AZURE_OPENAI_EMBEDDING_ENDPOINT=${AZURE_OPENAI_EMBEDDING_ENDPOINT}
+      - AZURE_OPENAI_EMBEDDING_API_VERSION=${AZURE_OPENAI_EMBEDDING_API_VERSION}
+      - AZURE_OPENAI_EMBEDDING_DEPLOYMENT=${AZURE_OPENAI_EMBEDDING_DEPLOYMENT}
+      
+      # OpenAI Configuration (fallback)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL_NAME=${OPENAI_MODEL_NAME}
+      
+      # AWS Configuration
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET}
+      - USE_S3_STORAGE=true
+      
+      # SearXNG Configuration
+      - SEARXNG_URL=${SEARXNG_URL:-http://localhost:8888/}
+      
+      # LinkedIn Configuration
+      - LINKEDIN_USERNAME=${LINKEDIN_USERNAME}
+      - LINKEDIN_PASSWORD=${LINKEDIN_PASSWORD}
+      
+      # Local cache
+      - LOCAL_CACHE_DIR=/tmp/ti-tool-cache
+    
+    volumes:
+      # Persist data directories
+      - ./data:/app/data
+      - ./crawled_data:/app/crawled_data
+      - ./processed_data:/app/processed_data
+      - ./summarised_content:/app/summarised_content
+      - ./embeddings_storage:/app/embeddings_storage
+      - ./rag_storage:/app/rag_storage
+      - ./linkedin_posts_monitor/linkedin_data:/app/linkedin_posts_monitor/linkedin_data
+      
+      # Persist logs
+      - ./research.log:/app/research.log
+    
+    restart: unless-stopped
+    
+    # Optional: Resource limits
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '2'
+    #       memory: 4G
+    #     reservations:
+    #       cpus: '1'
+    #       memory: 2G

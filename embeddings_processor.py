@@ -111,7 +111,7 @@ class JSONEmbeddingProcessor:
             if not api_key or not endpoint:
                 raise ValueError("Azure OpenAI credentials required: AZURE_OPENAI_EMBEDDING_API_KEY and AZURE_OPENAI_EMBEDDING_ENDPOINT")
             
-            self.client = AzureOpenAI(
+            self.client = AzureOpenAI( # type: ignore
                 api_key=api_key,
                 api_version=api_version,
                 azure_endpoint=endpoint

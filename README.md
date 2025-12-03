@@ -86,29 +86,8 @@ LM_STUDIO_API_KEY=lm-studio
 
 ### Required Environment Variables
 
-Create `.streamlit/secrets.toml` (for Streamlit Cloud) or `.env` (for local):
+Create `.env`:
 
-```toml
-[LLM_PROVIDER]
-PROVIDER = "azure"
-
-[AZURE_OPENAI]
-AZURE_OPENAI_API_KEY = "your-azure-api-key"
-AZURE_OPENAI_ENDPOINT = "https://your-resource.openai.azure.com/"
-AZURE_OPENAI_DEPLOYMENT_NAME = "gpt-4o-mini"
-AZURE_OPENAI_API_VERSION = "2024-02-15-preview"
-
-[AWS]
-AWS_ACCESS_KEY_ID = "your-access-key-id"
-AWS_SECRET_ACCESS_KEY = "your-secret-access-key"
-AWS_DEFAULT_REGION = "us-east-1"
-S3_BUCKET_NAME = "ti-tool-s3-storage"
-
-[SEARXNG]
-SEARXNG_URL = "http://your-searxng-instance:8080"
-```
-
-**For local development with `.env`:**
 ```bash
 AZURE_OPENAI_API_KEY=your_azure_key
 AZURE_OPENAI_ENDPOINT=your_azure_endpoint
@@ -121,17 +100,6 @@ SEARXNG_URL=http://localhost:8080
 Start SearXNG instance:
 ```docker run -d -p 32768:8080 searxng/searxng```
 
-Start Crawl4AI instance:
-```docker run -d \
--p 11235:11235 \
-  --name crawl4ai \
-  --shm-size=1g \
-  unclecode/crawl4ai:latest```
-
-```pip install crawl4ai
-crawl4ai-setup
-crawl4ai-doctor
-```
 
 ### Run the Application
 
@@ -179,7 +147,7 @@ TI-tool/
 │   ├── (...)                       # Others to handle robots.txt and URL tracking
 │   └── content_extractor.py        # Content extraction
 │
-└── S3 Storage (crawled_data/, processed_data/, summarised_content/, rag_storage/)
+└── S3 Storage (crawled_data/, processed_data/, summarised_content/, rag_embeddings/)
     # All data stored in AWS S3 bucket for persistence
 ```
 
@@ -190,14 +158,7 @@ This application uses **AWS S3** for persistent storage instead of local filesys
 - **crawled_data/**: Raw crawled website data
 - **processed_data/**: Filtered and processed URLs
 - **summarised_content/**: AI-generated summaries and analysis
-- **rag_storage/**: Vector embeddings for RAG chatbot
-
-**Benefits:**
-- ✅ Works on Streamlit Cloud (stateless containers)
-- ✅ Data persists across deployments
-- ✅ Accessible from anywhere
-- ✅ Automatic backups and versioning
-
+- **rag_embeddings/**: Vector embeddings for RAG chatbot
 ---
 
 ## Features
@@ -218,16 +179,14 @@ This application uses **AWS S3** for persistent storage instead of local filesys
 
 #### Tab 2: Filter URLs
 - Remove unwanted URLs from crawled data (e.g., `/about`, `/author`, `/contact`) *(the noisy data)*
-- Preview filtered results before saving
-- Saves filtered data to `processed_data/` in S3
+- Results are saved in a CSV file with column headers "date of crawl", "URL" and text_content"
+- Saves filtered data to `crawled_data/` in S3
 
 ### 3. LLM Extraction
-Use AI models to intelligently extract structured metadata from markdown files:
+Use AI models to extract structured metadata from 'text_content' column in each row of crawled data CSV file:
    * Title
    * Publication Date
-   * URL
    * Main Content
-   * Author
    * Tags/Categories
 
 **🔄 Interrupt Handling & Progress Preservation**
@@ -245,17 +204,12 @@ df, stats = await process_csv_with_progress(
     csv_path=csv_file,
     output_dir=output_dir,
     client=client,
-    model_name="gpt-4",
+    model_name="gpt-4.1-nano",
     checkpoint_interval=10,  # Save every 10 rows
     resume_from_checkpoint=True  # Resume from existing checkpoint
 )
 ```
-
-**Benefits:**
-- ✅ No progress loss from interruptions
-- ✅ Can pause/resume long-running extractions
-- ✅ Automatic cleanup of checkpoints after successful completion
-- ✅ Works with both CSV files and folder processing
+Results saved to `processed_data/` in S3.
 
 ### 4. Summarisation 
 Upload or select processed CSV files from S3 to perform summarization and classification:
@@ -280,71 +234,51 @@ Results saved to `summarised_content/` in S3.
 - **Website Citations**: Responses cite sources by name (e.g., `[canarymedia]`)
 - **Metadata Display**: Shows title, date, URL, tech fields
 
-**Example Usage: Watch the demo below**
-
-https://github.com/user-attachments/assets/813787e0-2526-40b6-a148-da4eb46a82bc
-
 ---
 
 ## Typical Workflow
 
 ```
-1. Web Crawler
+1. **Web Crawler**
    ↓
    Crawl target websites
    ↓
-   Save markdown files
+   Filter out noisy, irrelevant URLs
+   ↓
+   Save crawled content in CSV named `{website}_{date of crawl}_filtered.{ext}`
 
-2. LLM Extraction
+2. **LLM Extraction**
    ↓
-   Extract structured metadata
+   Extract {Title, Publication Date, Main Content, Categories/Tags}
    ↓
-   Save to processed files
+   Save to processed files as `<website>_<date of crawl>_filtered_<date of extraction>.{ext}`
 
-3. Summarization
+3. **Summarisation**
    ↓
-   Analyze with tech-intelligence
+   Generate summaries 
+   Classify dimension, technology and TRL
+   Identify URLs to start-up(s) if mentioned in articles
    ↓
-   Save to summarised_content/
+   Save to summarised_content/ as `<website>_<date of summarisation>.{ext}`
 
 4. Database
    ↓
-   Search, filter, export data
+   Filter by sources, date range and keywords
+   ↓
+   Export data as CSV or JSON formats
 
 5. RAG Chatbot
    ↓
    Build vector index
    ↓
-   Query with AI citations
+   Query with metadata filtering enabled alongside FAISS
 
 6. Linkedin Home Feed Monitor
    ↓
-   Adjust settings of 'scraper' based on number of days back and scroll pause duration.
+   Adjust settings of 'scraper' based on number of days back and scroll pause duration. Otherwise, runtime is 1 hour.
    ↓
    Download results, or store in S3
 ```
-
----
-
-## Streamlit Interface
-
-The application provides an intuitive web interface with advanced features for managing long-running processes:
-
-### Checkpoint Management
-- **Automatic Detection**: Interface detects existing checkpoint files and shows current progress
-- **Resume Options**: Checkbox to enable resuming from saved checkpoints
-- **Configurable Intervals**: Set checkpoint saving frequency (default: every 10 items)
-- **Progress Metrics**: Real-time display of processing status and completion percentage
-
-### Interrupt Handling
-- **Graceful Shutdown**: Ctrl+C or stop button triggers clean interruption with progress saving
-- **No Progress Loss**: All completed work is preserved even after interruptions
-- **Resume Capability**: Restart processing from exactly where it left off
-
-### Real-time Monitoring
-- **Live Progress Bars**: Visual indicators for extraction and summarization progress
-- **Status Updates**: Current operation and estimated completion time
-- **Error Handling**: Clear error messages with recovery suggestions
 
 ---
 
@@ -387,54 +321,6 @@ The app supports multiple LLM providers:
 - **Azure OpenAI** (default): `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`
 - **OpenAI**: Standard OpenAI models
 - **LM Studio**: Local models
-- **Anthropic**: Claude models
-
-Configure in the Summarization or RAG pages.
----
-
-## Usage Examples
-
-### Example 1: Crawl a News Site
-
-1. Go to **Web Crawler**
-2. Enter URL: `https://www.canarymedia.com`
-3. Click **Auto-Detection**
-4. Review recommended strategy (likely "Sitemap")
-5. Set max pages: `500`
-6. Click **Start Crawling**
-7. Wait for completion (*may take hours*)
-
-### Example 2: Extract Metadata with LLM
-
-1. Go to **LLM Extraction**
-2. Select folder: `canarymedia`
-3. **Configure Checkpointing** (optional):
-   - Enable **Resume from Checkpoint** to continue interrupted processing
-   - Set **Checkpoint Interval** (default: 10 items)
-   - View current progress if checkpoint exists
-4. Configure extraction fields
-5. Click **Start Extraction**
-6. **Interrupt Handling**: Use Ctrl+C in terminal or stop button to pause gracefully
-7. Files saved to extraction output folder with automatic progress preservation
-
-### Example 3: Generate Tech Intelligence
-
-1. Go to **Summarization**
-2. Upload the processed CSV
-3. Select model: `pmo-gpt-4.1-nano`
-4. Click **Start Summarization**
-5. Review Dimension, Tech, TRL, Start-up fields
-6. Save to summarised_content
-
-### Example 4: Query Your Knowledge Base
-
-1. Go to **RAG**
-2. Select JSON file: `canarymedia_20251029.json`
-3. Click **Build Index** (one-time)
-4. Ask: "What are the latest solar panel innovations?"
-5. Get cited answers: `[canarymedia]` references
-
----
 
 ## Important Notes
 
@@ -452,68 +338,8 @@ Configure in the Summarization or RAG pages.
 
 ### RAG
 
-- **Persistent storage**: Embeddings are saved to disk in rag_storage
+- **Persistent storage**: Embeddings are saved to S3 as pickle files in `rag_embeddings/`
 - **No rebuild needed**: Load existing indexes instantly
-- **Multiple sources**: Query across multiple indexes simultaneously
+- **Multiple sources**: Load the embeddings of the sources relevant to you from S3, then query across multiple indexes simultaneously
 
 ---
-
-## Troubleshooting
-
-### "503 Error" during crawl
-
-**Cause**: Site's firewall blocked the crawler (too many 404s or requests)
-
-**Solution**:
-- Use **Sitemap** strategy
-- Reduce crawl rate (add delays)
-- Check `robots.txt` for restrictions
-
-### "Progress display frozen"
-
-**Cause**: Streamlit UI limitation during long-running tasks
-
-**Solution**:
-- Monitor in terminal: `watch -n 1 'ls -lh crawled_data/{folder} | tail -20'`
-- Check output folder for new files
-- The process IS running even if UI freezes
-
-### "Checkpoint file not found"
-
-**Cause**: Previous processing completed successfully and checkpoint was cleaned up
-
-**Solution**:
-- Check if processing already completed in output folder
-- Start fresh extraction if needed
-- Check `processed_data/` for completed files
-
-### "Resume failed - invalid checkpoint"
-
-**Cause**: Checkpoint file corrupted or incompatible with current code version
-
-**Solution**:
-- Delete the checkpoint file manually
-- Restart processing from beginning
-- Ensure using compatible code version
-
-### "No JSON files found"
-
-**Cause**: Summarization hasn't completed or files saved elsewhere
-
-**Solution**:
-- Check summarised_content folder
-- Ensure summarization completed successfully
-- Check processing history in Summarization tab
-
----
-
-## Additional Resources
-
-- **Logs**: Check research.log for detailed execution logs
-- **Streamlit Docs**: https://docs.streamlit.io
-- **LlamaIndex Docs**: https://docs.llamaindex.ai
-- **Playwright Docs**: https://playwright.dev
-
----
-
-
