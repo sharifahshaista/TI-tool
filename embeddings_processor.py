@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Import for embeddings
 try:
-    from openai import OpenAI
+    from openai import OpenAI, AzureOpenAI
     HAS_OPENAI = True
 except ImportError:
     HAS_OPENAI = False
@@ -98,11 +98,36 @@ class JSONEmbeddingProcessor:
             raise ImportError("OpenAI package required. Install with: pip install openai")
         
         import os
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable required")
         
-        self.client = OpenAI(api_key=api_key, base_url="https://api.openai.com/v1") # type: ignore
+        # Determine which provider to use for embeddings
+        embedding_provider = os.getenv("EMBEDDING_PROVIDER", os.getenv("LLM_PROVIDER", "openai")).lower()
+        
+        if embedding_provider == "azure":
+            # Use Azure OpenAI for embeddings
+            api_key = os.getenv("AZURE_OPENAI_EMBEDDING_API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
+            endpoint = os.getenv("AZURE_OPENAI_EMBEDDING_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
+            api_version = os.getenv("AZURE_OPENAI_EMBEDDING_API_VERSION") or os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+            
+            if not api_key or not endpoint:
+                raise ValueError("Azure OpenAI credentials required: AZURE_OPENAI_EMBEDDING_API_KEY and AZURE_OPENAI_EMBEDDING_ENDPOINT")
+            
+            self.client = AzureOpenAI(
+                api_key=api_key,
+                api_version=api_version,
+                azure_endpoint=endpoint
+            ) # type: ignore
+            
+            # For Azure, use the deployment name for embeddings
+            self.embedding_model = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+            logger.info(f"✓ Using Azure OpenAI embeddings: {self.embedding_model}")
+        else:
+            # Use OpenAI for embeddings
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY environment variable required")
+            
+            self.client = OpenAI(api_key=api_key) # type: ignore
+            logger.info(f"✓ Using OpenAI embeddings: {self.embedding_model}")
         
         # Initialize S3 storage
         self.s3_storage = None

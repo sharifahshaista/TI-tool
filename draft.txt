@@ -1,0 +1,511 @@
+elif page == "Chatbot":
+    st.header("🤖 AI Research Assistant")
+    st.markdown("Chat with your technology intelligence database using AI-powered keyword search")
+    
+    # Initialize session state for chat
+    if 'chat_messages' not in st.session_state:
+        st.session_state.chat_messages = []
+    if 'chat_processor' not in st.session_state:
+        st.session_state.chat_processor = None
+    if 'embeddings_built' not in st.session_state:
+        st.session_state.embeddings_built = False
+    if 'embedding_indexes' not in st.session_state:
+        st.session_state.embedding_indexes = {}
+    
+    # Check for available data
+    summarised_dir = Path("summarised_content")
+    json_files = list(summarised_dir.glob("*.json")) if summarised_dir.exists() else []
+    
+    # Helper functions for source name and date extraction
+    def extract_source_name_from_filename(filename: str) -> str:
+        """Extract and format source name from filename."""
+        from pathlib import Path
+        
+        # Remove .json extension and split by underscores
+        stem = Path(filename).stem
+        parts = stem.split('_')
+        
+        # Take first part and capitalize it
+        if parts:
+            source = parts[0].replace('com', '').replace('org', '').replace('net', '')
+            return source.capitalize()
+        
+        return stem
+    
+    def extract_date_from_filename(filename: str) -> str:
+        """Extract and format date from filename."""
+        from pathlib import Path
+        import re
+        
+        # Remove .json extension
+        stem = Path(filename).stem
+        
+        # Look for date pattern YYYYMMDD
+        date_match = re.search(r'_(\d{8})$', stem)
+        if date_match:
+            date_str = date_match.group(1)
+            # Format as YYYY-MM-DD
+            return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+        
+        return ""
+    
+    # Get available JSON files with metadata
+    available_files = []
+    for json_file in json_files:
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if data:  # Check if file has content
+                    # Extract source name and date from filename
+                    filename = json_file.name
+                    source_name = extract_source_name_from_filename(filename)
+                    date_str = extract_date_from_filename(filename)
+                    
+                    available_files.append({
+                        'filename': filename,
+                        'source_name': source_name,
+                        'date': date_str,
+                        'path': json_file,
+                        'count': len(data)
+                    })
+        except Exception as e:
+            st.warning(f"⚠️ Could not read {json_file.name}: {e}")
+    
+    # Create options for multiselect with compact format for sidebar display
+    # Format: <Source> <date>
+    file_options = []
+    file_options_dict = {}
+    
+    for f in available_files:
+        # Compact format: "Techcrunch 11/28"
+        date_parts = f['date'].split('-') if f['date'] else ['', '', '']
+        if len(date_parts) == 3:
+            short_date = f"{date_parts[1]}/{date_parts[2]}"  # MM/DD
+        else:
+            short_date = ""
+        
+        compact_label = f"{f['source_name']} {short_date}"
+        file_options.append(compact_label)
+        file_options_dict[compact_label] = f
+    
+    # Default to all files if none selected, or filter out invalid cached selections
+    if 'selected_files' not in st.session_state:
+        st.session_state.selected_files = file_options
+    else:
+        # Filter out any cached selections that are no longer valid
+        st.session_state.selected_files = [opt for opt in st.session_state.selected_files if opt in file_options]
+        # If all selections were invalid, default to all files
+        if not st.session_state.selected_files:
+            st.session_state.selected_files = file_options
+    
+    # Sidebar controls
+    with st.sidebar:
+        # File selection widget in sidebar
+        if file_options:
+            st.markdown("### 📂 Select Data Sources")
+            
+            selected_options = st.multiselect(
+                "Choose data sources:",
+                options=file_options,
+                default=st.session_state.selected_files,
+                help="Format: Source MM/DD. Example: Techcrunch 11/28",
+                label_visibility="collapsed"
+            )
+            
+            # Update session state
+            st.session_state.selected_files = selected_options
+            
+            # Get selected file objects
+            selected_files = [file_options_dict[opt] for opt in selected_options] if selected_options else []
+            
+            if not selected_files:
+                st.warning("Please select at least one data source.")
+                st.stop()
+            
+            st.divider()
+        
+        st.markdown("### 🗄️ Database Status")
+        
+        # Check if embeddings exist in S3
+        s3_available_indexes = []
+        try:
+            from aws_storage import get_storage
+            s3_storage = get_storage()
+            s3_files = s3_storage.list_files(prefix="rag_embeddings/", suffix=".pkl")
+            
+            # Extract index names from S3 files
+            for s3_file in s3_files:
+                # Extract index name from path: "rag_embeddings/embeddings_name.pkl"
+                index_name = s3_file.replace("rag_embeddings/", "").replace(".pkl", "")
+                s3_available_indexes.append(index_name)
+            
+            embeddings_in_s3 = len(s3_available_indexes) > 0
+            
+            # Debug info
+            if embeddings_in_s3:
+                st.success(f"☁️ Embeddings found in S3 ({len(s3_available_indexes)} file(s))")
+                st.markdown("**Available S3 Indexes:**")
+                for idx_name in s3_available_indexes:
+                    # Format: Source_embeddings_YYYYMMDD -> Source (YYYY-MM-DD)
+                    display_name = idx_name
+                    # Extract date if present (YYYYMMDD pattern at the end)
+                    import re
+                    date_match = re.search(r'_(\d{8})$', display_name)
+                    if date_match:
+                        date_str = date_match.group(1)
+                        source_part = display_name[:date_match.start()]
+                        # Remove _embeddings suffix if present
+                        source_part = source_part.replace('_embeddings', '')
+                        formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                        display_name = f"{source_part} ({formatted_date})"
+                    else:
+                        # No date found, just remove _embeddings
+                        display_name = display_name.replace('_embeddings', '')
+                    st.caption(f"• {display_name}")
+            else:
+                st.info("☁️ No embeddings found in S3")
+        except Exception as e:
+            embeddings_in_s3 = False
+            s3_error = str(e)
+            st.warning(f"⚠️ S3 connection issue: {s3_error}")
+        
+        if st.session_state.embeddings_built:
+            st.success(f"✅ Data indexed")
+            
+            # Show document count for loaded sources
+            if st.session_state.embedding_indexes:
+                loaded_sources = list(st.session_state.embedding_indexes.keys())
+                total_docs = sum(idx.num_documents for idx in st.session_state.embedding_indexes.values())
+                total_chunks = sum(idx.num_chunks for idx in st.session_state.embedding_indexes.values())
+                st.metric("Loaded Sources", len(loaded_sources))
+                st.metric("Documents", total_docs)
+                st.metric("Chunks", total_chunks)
+                
+                # Show which sources are loaded with date
+                with st.expander("📋 Loaded Sources", expanded=False):
+                    for source in loaded_sources:
+                        # Format: Source_embeddings_YYYYMMDD -> Source (YYYY-MM-DD)
+                        display_name = source
+                        # Extract date if present (YYYYMMDD pattern at the end)
+                        import re
+                        date_match = re.search(r'_(\d{8})$', display_name)
+                        if date_match:
+                            date_str = date_match.group(1)
+                            source_part = display_name[:date_match.start()]
+                            # Remove _embeddings suffix if present
+                            source_part = source_part.replace('_embeddings', '')
+                            formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                            display_name = f"{source_part} ({formatted_date})"
+                        else:
+                            # No date found, just remove _embeddings
+                            display_name = display_name.replace('_embeddings', '')
+                        st.write(f"• {display_name}")
+            elif st.session_state.chat_processor:
+                try:
+                    count = len(st.session_state.chat_processor.documents)
+                    st.metric("Documents", count)
+                except:
+                    pass
+
+        st.divider()
+        
+        # Load from S3 button with file selection
+        if embeddings_in_s3 and not st.session_state.embeddings_built:
+            st.markdown("### 📥 Load from S3")
+            
+            # Format index names for display
+            formatted_options = []
+            index_display_map = {}
+            
+            for idx_name in s3_available_indexes:
+                # Format: Source_embeddings_YYYYMMDD -> Source (YYYY-MM-DD)
+                display_name = idx_name
+                import re
+                date_match = re.search(r'_(\d{8})$', display_name)
+                if date_match:
+                    date_str = date_match.group(1)
+                    source_part = display_name[:date_match.start()]
+                    source_part = source_part.replace('_embeddings', '')
+                    formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                    display_name = f"{source_part} ({formatted_date})"
+                else:
+                    display_name = display_name.replace('_embeddings', '')
+                
+                formatted_options.append(display_name)
+                index_display_map[display_name] = idx_name
+            
+            # Multi-select widget for choosing which indexes to load
+            selected_display_names = st.multiselect(
+                "Select embeddings to load:",
+                options=formatted_options,
+                default=formatted_options,  # All selected by default
+                help="Choose which embedding indexes to load from S3",
+                key="s3_embeddings_select"
+            )
+            
+            # Map back to original index names
+            selected_indexes = [index_display_map[name] for name in selected_display_names]
+            
+            if not selected_indexes:
+                st.warning("Please select at least one embedding index to load.")
+            elif st.button("☁️ Load from S3", use_container_width=True, type="secondary", disabled=len(selected_indexes) == 0):
+                with st.spinner("Downloading embeddings from S3..."):
+                    try:
+                        from embeddings_processor import JSONEmbeddingProcessor
+                        processor = JSONEmbeddingProcessor()
+                        
+                        embedding_indexes = {}
+                        loaded_count = 0
+                        
+                        # Download only selected indexes from S3
+                        for index_name in selected_indexes:
+                            try:
+                                st.info(f"Downloading {index_name}...")
+                                embedding_index = processor.download_index_from_s3(index_name)
+                                if embedding_index:
+                                    embedding_indexes[index_name] = embedding_index
+                                    loaded_count += 1
+                                    st.success(f"✓ Loaded {index_name}: {embedding_index.num_documents} docs, {embedding_index.num_chunks} chunks")
+                            except Exception as e:
+                                st.warning(f"Failed to download {index_name}: {e}")
+                        
+                        if embedding_indexes:
+                            st.session_state.chat_processor = processor
+                            st.session_state.embedding_indexes = embedding_indexes
+                            st.session_state.embeddings_built = True
+                            total_docs = sum(idx.num_documents for idx in embedding_indexes.values())
+                            total_chunks = sum(idx.num_chunks for idx in embedding_indexes.values())
+                            st.success(f"✅ Loaded {loaded_count} index(es) from S3! {total_docs} documents ({total_chunks} chunks)")
+                            st.rerun()
+                        else:
+                            st.error("Failed to load any embeddings from S3")
+                    except Exception as e:
+                        st.error(f"Error loading from S3: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+        
+        st.divider()
+        
+        # Retrieval settings
+        st.markdown("### ⚙️ Retrieval Settings")
+        num_results = st.slider(
+            "Number of documents to retrieve",
+            min_value=5,
+            max_value=30,
+            value=10,
+            step=1,
+            help="Adjust how many relevant documents are retrieved and used to generate the response"
+        )
+        
+        st.divider()
+        
+        # Clear chat history
+        if st.button("🗑️ Clear Chat History", use_container_width=True):
+            st.session_state.chat_messages = []
+            st.rerun()
+    
+    # Main chat interface
+    if not st.session_state.embeddings_built:
+        st.info("👆 Click **Load from S3** in the sidebar to start chatting")
+        st.stop()
+    
+    # Load processor if not in session state
+    if st.session_state.chat_processor is None:
+        try:
+            processor = CSVEmbeddingProcessor(
+                csv_folder=str(summarised_dir),
+                collection_name="tech_intelligence"
+            )
+            processor.process_all()
+            st.session_state.chat_processor = processor
+        except Exception as e:
+            st.error(f"Error loading data: {e}")
+            st.stop()
+    
+    # Display chat messages
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            
+            # Show sources if available
+            if "sources" in message and message["sources"]:
+                with st.expander("📚 Sources"):
+                    for i, source in enumerate(message["sources"], 1):
+                        # Use URL as title if title is None or empty
+                        title = source.get('title', 'Untitled')
+                        if not title or title.lower() in ['none', 'untitled', 'n/a']:
+                            title = source.get('url', 'Untitled')
+                        
+                        st.markdown(f"**{i}. [{title}]({source['url']})**")
+                        
+                        # Display fields in a structured format
+                        col1, col2 = st.columns([1, 2])
+                        
+                        with col1:
+                            st.markdown("**📊 Metadata:**")
+                            st.caption(f"**Date:** {source.get('publication_date', 'N/A')}")
+                            st.caption(f"**Categories:** {source.get('categories', 'N/A')}")
+                            st.caption(f"**Tech:** {source.get('tech', 'N/A')}")
+                            st.caption(f"**TRL:** {source.get('trl', 'N/A')}")
+                            st.caption(f"**Dimension:** {source.get('dimension', 'N/A')}")
+                            if source.get('startup') and source.get('startup') not in ['N/A', 'None', '']:
+                                st.caption(f"**Start-up:** {source.get('startup', 'N/A')}")
+                        
+                        with col2:
+                            st.markdown("**📝 Summary:**")
+                            indicator_text = source.get('indicator', 'N/A')
+                            if indicator_text and indicator_text not in ['N/A', 'None', '']:
+                                st.caption(indicator_text)
+                            else:
+                                st.caption("No summary available")
+                        
+                        st.divider()
+    
+    # Chat input
+    if prompt := st.chat_input("Ask a question about technology intelligence..."):
+        # Add user message to chat
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Generate response
+        with st.chat_message("assistant"):
+            with st.spinner("Searching knowledge base..."):
+                try:
+                    processor = st.session_state.chat_processor
+                    embedding_indexes = st.session_state.embedding_indexes
+                    
+                    # Query all loaded embedding indexes
+                    all_results = []
+                    for index_name, embedding_index in embedding_indexes.items():
+                        # Query this index (returns list of dicts with 'score', 'text', 'metadata')
+                        index_results = processor.query_similar(
+                            embedding_index,
+                            prompt,
+                            top_k=num_results
+                        )
+                        
+                        # Add source name to results
+                        for result in index_results:
+                            result['source_index'] = index_name
+                            all_results.append(result)
+                    
+                    # Sort all results by score and take top N
+                    all_results.sort(key=lambda x: x['score'], reverse=True)
+                    top_results = all_results[:num_results]
+                    
+                    # Extract relevant information
+                    sources = []
+                    context_texts = []
+                    
+                    for result in top_results:
+                        metadata = result['metadata']
+                        
+                        # Add to sources with ALL available fields
+                        sources.append({
+                            "url": metadata.get("url", ""),
+                            "title": metadata.get("title", "Untitled"),
+                            "publication_date": metadata.get("publication_date", ""),
+                            "categories": metadata.get("categories", ""),
+                            "indicator": metadata.get("full_indicator", ""),
+                            "dimension": metadata.get("dimension", ""),
+                            "tech": metadata.get("tech", ""),
+                            "trl": metadata.get("trl", ""),
+                            "startup": metadata.get("startup", ""),
+                            "source": metadata.get("source", "")
+                        })
+                        
+                        # Add to context
+                        context_texts.append(result['text'])
+                    
+                    # Generate response using OpenAI
+                    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+                    
+                    # Create system prompt with context
+                    system_prompt = """You are an AI research assistant specialized in technology intelligence and innovation analysis. 
+You have access to a knowledge base of articles about emerging technologies, startups, carbon markets, and clean energy.
+
+Use the provided context to answer questions accurately and comprehensively. 
+If the context doesn't contain relevant information, say so clearly.
+Always cite specific details from the sources when possible."""
+                    
+                    # Create context from search results
+                    context = "\n\n---\n\n".join(context_texts) if context_texts else "No relevant information found in the knowledge base."
+                    
+                    user_prompt = f"""Context from knowledge base:
+{context}
+
+---
+
+User question: {prompt}
+
+Please provide a comprehensive answer based on the context above. If the context doesn't contain enough information to answer the question, acknowledge this and provide what information is available."""
+                    
+                    # Stream response
+                    response_placeholder = st.empty()
+                    full_response = ""
+                    
+                    stream = openai_client.chat.completions.create(
+                        model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"),
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.7,
+                        max_tokens=1500,
+                        stream=True
+                    )
+                    
+                    for chunk in stream:
+                        if chunk.choices[0].delta.content is not None:
+                            full_response += chunk.choices[0].delta.content
+                            response_placeholder.markdown(full_response + "▌")
+                    
+                    response_placeholder.markdown(full_response)
+                    
+                    # Show sources
+                    if sources:
+                        with st.expander("📚 Sources"):
+                            for i, source in enumerate(sources, 1):
+                                # Use URL as title if title is None or empty
+                                title = source.get('title', 'Untitled')
+                                if not title or title.lower() in ['none', 'untitled', 'n/a']:
+                                    title = source.get('url', 'Untitled')
+                                
+                                st.markdown(f"**{i}. [{title}]({source['url']})**")
+                                
+                                # Display fields in a structured format
+                                col1, col2 = st.columns([1, 2])
+                                
+                                with col1:
+                                    st.markdown("**📊 Metadata:**")
+                                    st.caption(f"**Date:** {source.get('publication_date', 'N/A')}")
+                                    st.caption(f"**Categories:** {source.get('categories', 'N/A')}")
+                                    st.caption(f"**Tech:** {source.get('tech', 'N/A')}")
+                                    st.caption(f"**TRL:** {source.get('trl', 'N/A')}")
+                                    st.caption(f"**Dimension:** {source.get('dimension', 'N/A')}")
+                                    if source.get('startup') and source.get('startup') not in ['N/A', 'None', '']:
+                                        st.caption(f"**Start-up:** {source.get('startup', 'N/A')}")
+                                
+                                with col2:
+                                    st.markdown("**📝 Summary:**")
+                                    indicator_text = source.get('indicator', 'N/A')
+                                    if indicator_text and indicator_text not in ['N/A', 'None', '']:
+                                        st.caption(indicator_text)
+                                    else:
+                                        st.caption("No summary available")
+                                
+                                st.divider()
+                    
+                    # Add assistant response to chat history
+                    st.session_state.chat_messages.append({
+                        "role": "assistant",
+                        "content": full_response,
+                        "sources": sources
+                    })
+                    
+                except Exception as e:
+                    st.error(f"Error generating response: {e}")
+                    st.stop()

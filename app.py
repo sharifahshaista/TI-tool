@@ -2593,6 +2593,13 @@ elif page == "Database":
         for csv_file in file_list:
             try:
                 df = pd.read_csv(csv_file)
+                
+                # Handle duplicate columns - keep only the first occurrence
+                if df.columns.duplicated().any():
+                    duplicate_cols = df.columns[df.columns.duplicated()].tolist()
+                    st.warning(f"⚠️ File {csv_file.name} has duplicate columns: {duplicate_cols}. Keeping only first occurrence.")
+                    df = df.loc[:, ~df.columns.duplicated()]
+                
                 df['source_file'] = csv_file.stem  # Add source file name
                 # Extract date from filename (format: name_summarized_YYYYMMDD_HHMMSS)
                 parts = csv_file.stem.split('_')
@@ -2940,6 +2947,12 @@ elif page == "Database":
         exclude_cols = ['source_file', 'processed_date', 'content', 'file', 'file_location', 
                        'filename', 'file_name', 'folder', 'filepath', 'Source', 'source', 'author']
         display_df = filtered_df.drop(columns=[col for col in exclude_cols if col in filtered_df.columns])
+        
+        # Handle any duplicate columns before reordering
+        if display_df.columns.duplicated().any():
+            duplicate_cols = display_df.columns[display_df.columns.duplicated()].tolist()
+            st.warning(f"⚠️ Removing duplicate columns: {duplicate_cols}")
+            display_df = display_df.loc[:, ~display_df.columns.duplicated()]
         
         # Define desired column order
         desired_order = [
@@ -4125,8 +4138,23 @@ elif page == "Chatbot":
                             # Add to context (use the chunk text)
                             context_texts.append(result['text'])
                     
-                    # Generate response using OpenAI
-                    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url="https://api.openai.com/v1")
+                    # Generate response using configured LLM provider
+                    from openai import OpenAI, AzureOpenAI
+                    
+                    llm_provider = os.getenv("LLM_PROVIDER", "openai").lower()
+                    
+                    if llm_provider == "azure":
+                        # Use Azure OpenAI
+                        openai_client = AzureOpenAI(
+                            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"),
+                            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+                        )
+                        model_name = os.getenv("AZURE_OPENAI_MODEL_NAME", "gpt-4")
+                    else:
+                        # Use OpenAI
+                        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+                        model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
                     
                     # Create system prompt with context
                     current_date = datetime.now().strftime("%B %d, %Y")  # e.g., "December 01, 2025"
@@ -4260,7 +4288,7 @@ Answer: """
                     full_response = ""
                     
                     stream = openai_client.chat.completions.create(
-                        model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"),
+                        model=model_name,
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt}
@@ -4271,9 +4299,10 @@ Answer: """
                     )
                     
                     for chunk in stream:
-                        if chunk.choices[0].delta.content is not None:
-                            full_response += chunk.choices[0].delta.content
-                            response_placeholder.markdown(full_response + "▌")
+                        if chunk.choices and len(chunk.choices) > 0:
+                            if chunk.choices[0].delta.content is not None:
+                                full_response += chunk.choices[0].delta.content
+                                response_placeholder.markdown(full_response + "▌")
                     
                     response_placeholder.markdown(full_response)
                     
@@ -4327,7 +4356,12 @@ Answer: """
                     })
                     
                 except Exception as e:
+                    import traceback
+                    error_details = traceback.format_exc()
                     st.error(f"Error generating response: {e}")
+                    with st.expander("📋 Error Details"):
+                        st.code(error_details)
+                    logging.error(f"Chatbot error: {e}\n{error_details}")
                     st.stop()
 
 
@@ -5370,6 +5404,7 @@ current_provider = os.getenv("LLM_PROVIDER", "openai").lower()
 
 # Map provider codes to display names
 provider_display_map = {
+    "azure": "Azure OpenAI",
     "openai": "OpenAI",
     "lm_studio": "LM Studio (Local)"
 }
@@ -5405,7 +5440,12 @@ if provider_options:
         st.sidebar.success(f"✅ Switched to {selected_provider_display}")
     
     # Show provider-specific info
-    if selected_provider == "openai":
+    if selected_provider == "azure":
+        model_name = os.getenv("AZURE_OPENAI_MODEL_NAME", "gpt-4")
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "Not set")
+        st.sidebar.caption(f"Model: {model_name}")
+        st.sidebar.caption(f"Endpoint: {endpoint[:50]}...")
+    elif selected_provider == "openai":
         model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
         st.sidebar.caption(f"Model: {model_name}")
     elif selected_provider == "lm_studio":
