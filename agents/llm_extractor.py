@@ -64,18 +64,30 @@ class CheckpointManager:
     
     def save_checkpoint(self, current_row: int, extracted_data: list, total_rows: int):
         """Save current progress to checkpoint file."""
-        self.checkpoint_data['processed_indices'] = list(self.checkpoint_data['processed_indices'])
-        self.checkpoint_data['extracted_data'] = extracted_data
-        self.checkpoint_data['current_row'] = current_row
-        self.checkpoint_data['total_rows'] = total_rows
-        self.checkpoint_data['last_save_time'] = datetime.now().isoformat()
+        # Convert set to list for JSON serialization
+        processed_indices_list = list(self.checkpoint_data['processed_indices'])
+        
+        checkpoint_to_save = {
+            'processed_indices': processed_indices_list,
+            'extracted_data': extracted_data,
+            'current_row': current_row,
+            'total_rows': total_rows,
+            'last_save_time': datetime.now().isoformat(),
+            'start_time': self.checkpoint_data.get('start_time')
+        }
         
         try:
             # Ensure directory exists
             self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
             
             with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(self.checkpoint_data, f, indent=2, ensure_ascii=False)
+                json.dump(checkpoint_to_save, f, indent=2, ensure_ascii=False)
+            
+            # Update checkpoint data but keep processed_indices as a set
+            self.checkpoint_data['extracted_data'] = extracted_data
+            self.checkpoint_data['current_row'] = current_row
+            self.checkpoint_data['total_rows'] = total_rows
+            self.checkpoint_data['last_save_time'] = checkpoint_to_save['last_save_time']
             
             print(f"💾 Checkpoint saved: {len(self.checkpoint_data['processed_indices'])} rows processed")
         except Exception as e:

@@ -44,7 +44,7 @@ def fix_json_file(file_path):
 
 if __name__ == "__main__":
     # Path to the JSON file
-    file_path = Path("/Users/sharifahshaista/TI-tool/processed_data/techcrunch_com_20251127_filtered_20251127.json")
+    file_path = Path("/Users/sharifahshaista/TI-tool/processed_data/techcrunch_com_20251204_filtered_20251204.json")
 
     if file_path.exists():
         fix_json_file(file_path)

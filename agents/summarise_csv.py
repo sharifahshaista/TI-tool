@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 import time
+import json
 
 # Import S3 storage
 try:
@@ -19,6 +20,95 @@ try:
     HAS_S3_STORAGE = True
 except ImportError:
     HAS_S3_STORAGE = False
+
+# Checkpoint Manager for resumable processing
+class CheckpointManager:
+    """Manages checkpoints for resumable summarization processing."""
+    
+    def __init__(self, checkpoint_file: Path):
+        self.checkpoint_file = checkpoint_file
+        self.checkpoint_data = {
+            'processed_indices': set(),
+            'processed_rows': {},  # Store processed row data
+            'start_time': None,
+            'last_save_time': None,
+            'total_rows': 0,
+            'current_row': 0
+        }
+        self.load_checkpoint()
+    
+    def load_checkpoint(self):
+        """Load existing checkpoint if available."""
+        if self.checkpoint_file.exists():
+            try:
+                with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.checkpoint_data.update(data)
+                    # Convert processed_indices back to set
+                    self.checkpoint_data['processed_indices'] = set(self.checkpoint_data.get('processed_indices', []))
+                print(f"✅ Loaded checkpoint from {self.checkpoint_file}")
+                print(f"   - Processed {len(self.checkpoint_data['processed_indices'])} rows")
+                print(f"   - Current row: {self.checkpoint_data.get('current_row', 0)}")
+            except Exception as e:
+                print(f"⚠️ Failed to load checkpoint: {e}")
+    
+    def save_checkpoint(self, current_row: int, processed_rows: dict, total_rows: int):
+        """Save current progress to checkpoint file."""
+        # Convert set to list for JSON serialization
+        processed_indices_list = list(self.checkpoint_data['processed_indices'])
+        
+        checkpoint_to_save = {
+            'processed_indices': processed_indices_list,
+            'processed_rows': processed_rows,
+            'current_row': current_row,
+            'total_rows': total_rows,
+            'last_save_time': datetime.now().isoformat(),
+            'start_time': self.checkpoint_data.get('start_time')
+        }
+        
+        try:
+            # Ensure directory exists
+            self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint_to_save, f, indent=2, ensure_ascii=False)
+            
+            # Update checkpoint data but keep processed_indices as a set
+            self.checkpoint_data['processed_rows'] = processed_rows
+            self.checkpoint_data['current_row'] = current_row
+            self.checkpoint_data['total_rows'] = total_rows
+            self.checkpoint_data['last_save_time'] = checkpoint_to_save['last_save_time']
+            
+            print(f"💾 Checkpoint saved: {len(self.checkpoint_data['processed_indices'])} rows processed")
+        except Exception as e:
+            print(f"⚠️ Failed to save checkpoint: {e}")
+    
+    def is_processed(self, row_index: int) -> bool:
+        """Check if a row has already been processed."""
+        return row_index in self.checkpoint_data['processed_indices']
+    
+    def mark_processed(self, row_index: int):
+        """Mark a row as processed."""
+        self.checkpoint_data['processed_indices'].add(row_index)
+    
+    def get_processed_row(self, row_index: int) -> dict:
+        """Get the processed data for a specific row."""
+        return self.checkpoint_data['processed_rows'].get(str(row_index), {})
+    
+    def get_resume_point(self) -> int:
+        """Get the row index to resume from."""
+        if self.checkpoint_data['processed_indices']:
+            return max(self.checkpoint_data['processed_indices']) + 1
+        return 0
+    
+    def cleanup(self):
+        """Remove checkpoint file after successful completion."""
+        if self.checkpoint_file.exists():
+            try:
+                self.checkpoint_file.unlink()
+                print(f"🗑️ Checkpoint file removed: {self.checkpoint_file}")
+            except Exception as e:
+                print(f"⚠️ Failed to remove checkpoint file: {e}")
 
 # Tech Intelligence Summarization Prompt
 TECH_INTEL_PROMPT = """
@@ -157,7 +247,9 @@ async def summarize_csv_file(
     csv_file_path: Path,
     content_column: str = "content",
     progress_callback=None,
-    custom_model=None
+    custom_model=None,
+    use_checkpoint: bool = True,
+    checkpoint_interval: int = 5
 ) -> tuple[pd.DataFrame, float, dict]:
     """
     Process a CSV file and summarize the content column
@@ -167,11 +259,21 @@ async def summarize_csv_file(
         content_column: Name of the column containing content to summarize
         progress_callback: Optional callback function(current, total, elapsed, est_remaining)
         custom_model: Optional custom model to use for summarization
+        use_checkpoint: Whether to use checkpoint for resumable processing
+        checkpoint_interval: Save checkpoint every N rows
         
     Returns:
         Tuple of (processed_dataframe, duration_seconds, metadata)
     """
     start_time = time.time()
+    
+    # Initialize checkpoint manager if enabled
+    checkpoint_manager = None
+    if use_checkpoint:
+        checkpoint_file = Path("summarised_content") / f"{csv_file_path.stem}_checkpoint.json"
+        checkpoint_manager = CheckpointManager(checkpoint_file)
+        if checkpoint_manager.checkpoint_data.get('start_time') is None:
+            checkpoint_manager.checkpoint_data['start_time'] = datetime.now().isoformat()
     
     # Read CSV file
     try:
@@ -211,8 +313,32 @@ async def summarize_csv_file(
     successful = 0
     failed = 0
     
+    # Store processed row data for checkpointing
+    processed_rows_data = checkpoint_manager.checkpoint_data.get('processed_rows', {}) if checkpoint_manager else {}
+    
+    # Restore processed data from checkpoint
+    if checkpoint_manager:
+        for idx_str, row_data in processed_rows_data.items():
+            idx = int(idx_str)
+            df.loc[idx, 'Indicator'] = row_data.get('indicator', '')
+            df.loc[idx, 'Dimension'] = row_data.get('dimension', '')
+            df.loc[idx, 'Tech'] = row_data.get('tech', '')
+            df.loc[idx, 'TRL'] = row_data.get('trl', '')
+            df.loc[idx, 'URL to start-up(s)'] = row_data.get('start_up', '')
+            successful += 1
+        
+        if processed_rows_data:
+            logging.info(f"Restored {len(processed_rows_data)} previously processed rows from checkpoint")
+    
     # Process each row
     for row_num, (idx, row) in enumerate(df.iterrows()):
+        # Ensure idx is treated as int for type checking
+        row_idx = int(idx)  # type: ignore
+        
+        # Skip if already processed
+        if checkpoint_manager and checkpoint_manager.is_processed(row_idx):
+            continue
+        
         row_start_time = time.time()
         
         try:
@@ -227,6 +353,17 @@ async def summarize_csv_file(
                 df.loc[idx, 'URL to start-up(s)'] = ''  # type: ignore
                 failed += 1
                 logging.warning(f"Row {row_num + 1}/{total_rows} has no content to process")
+                
+                # Mark as processed even though it failed
+                if checkpoint_manager:
+                    checkpoint_manager.mark_processed(row_idx)
+                    processed_rows_data[str(row_idx)] = {
+                        'indicator': "[Empty content - no summary generated]",
+                        'dimension': '',
+                        'tech': '',
+                        'trl': '',
+                        'start_up': ''
+                    }
                 continue
             
             # Summarize content and extract structured fields
@@ -241,6 +378,11 @@ async def summarize_csv_file(
             
             successful += 1
             
+            # Mark as processed and save to checkpoint data
+            if checkpoint_manager:
+                checkpoint_manager.mark_processed(row_idx)
+                processed_rows_data[str(row_idx)] = structured_data
+            
             logging.info(f"Processed row {row_num + 1}/{total_rows}")
             
         except Exception as e:
@@ -250,6 +392,21 @@ async def summarize_csv_file(
             df.loc[idx, 'Tech'] = ''  # type: ignore
             df.loc[idx, 'URL to start-up(s)'] = ''  # type: ignore
             failed += 1
+            
+            # Mark as processed even though it failed
+            if checkpoint_manager:
+                checkpoint_manager.mark_processed(row_idx)
+                processed_rows_data[str(row_idx)] = {
+                    'indicator': f"[Error: {str(e)}]",
+                    'dimension': '',
+                    'tech': '',
+                    'trl': '',
+                    'start_up': ''
+                }
+        
+        # Save checkpoint periodically
+        if checkpoint_manager and (row_num + 1) % checkpoint_interval == 0:
+            checkpoint_manager.save_checkpoint(row_num + 1, processed_rows_data, total_rows)
         
         # Calculate progress and time estimates
         current_row = row_num + 1
@@ -267,6 +424,10 @@ async def summarize_csv_file(
         if progress_callback:
             progress_callback(current_row, total_rows, elapsed_time, est_remaining)
     
+    # Save final checkpoint
+    if checkpoint_manager:
+        checkpoint_manager.save_checkpoint(total_rows, processed_rows_data, total_rows)
+    
     # Calculate duration
     duration = time.time() - start_time
     
@@ -280,6 +441,10 @@ async def summarize_csv_file(
         'source_file': csv_file_path.name,
         'content_column': content_column
     }
+    
+    # Clean up checkpoint on successful completion
+    if checkpoint_manager:
+        checkpoint_manager.cleanup()
     
     return df, duration, metadata
 

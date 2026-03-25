@@ -39,8 +39,8 @@ def update_csv_from_json(json_file, csv_file):
         writer.writerows(csv_data)
 
 if __name__ == "__main__":
-    json_file = Path("/Users/sharifahshaista/TI-tool/processed_data/techcrunch_com_20251127_filtered_20251127.json")
-    csv_file = Path("/Users/sharifahshaista/TI-tool/processed_data/techcrunch_com_20251127_filtered_20251127.csv")
+    json_file = Path("/Users/sharifahshaista/TI-tool/processed_data/techcrunch_com_20251204_filtered_20251204.json")
+    csv_file = Path("/Users/sharifahshaista/TI-tool/processed_data/techcrunch_com_20251204_filtered_20251204.csv")
 
     if json_file.exists() and csv_file.exists():
         update_csv_from_json(json_file, csv_file)

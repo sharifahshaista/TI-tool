@@ -54,7 +54,7 @@ logging.basicConfig(
 
 # Set page configuration for wide layout
 st.set_page_config(
-    page_title="TI Agent",
+    page_title="TI tool backend",
     page_icon="🔬",
     layout="wide",  # Use full width of the page
     initial_sidebar_state="expanded"
@@ -943,7 +943,7 @@ elif page == "Web Crawler":
                     max_pages = st.number_input(
                         "Max Pages",
                         min_value=1,
-                        max_value=10000,
+                        max_value=100000,
                         value=100,
                         help="Maximum number of pages to crawl"
                     )
@@ -2092,8 +2092,99 @@ elif page == "Summarization":
                 st.subheader("Data Preview")
                 st.dataframe(df_preview.head(10), use_container_width=True)
 
+                st.divider()
+
+                # Checkpointing configuration
+                st.subheader("💾 Checkpointing & Resume")
+                
+                # Check if checkpoint exists for selected file
+                checkpoint_info = None
+                if selected_csv_path and selected_csv_path.exists():
+                    from agents.summarise_csv import CheckpointManager
+                    checkpoint_file = Path("summarised_content") / f"{selected_csv_path.stem}_checkpoint.json"
+                    
+                    if checkpoint_file.exists():
+                        try:
+                            checkpoint_manager = CheckpointManager(checkpoint_file)
+                            checkpoint_data = checkpoint_manager.checkpoint_data
+                            
+                            if checkpoint_data.get('processed_indices'):
+                                processed_count = len(checkpoint_data['processed_indices'])
+                                total_count = checkpoint_data.get('total_rows', 0)
+                                last_save = checkpoint_data.get('last_save_time')
+                                
+                                if last_save:
+                                    from datetime import datetime
+                                    try:
+                                        last_save_dt = datetime.fromisoformat(last_save.replace('Z', '+00:00'))
+                                        last_save_str = last_save_dt.strftime('%Y-%m-%d %H:%M:%S')
+                                    except:
+                                        last_save_str = last_save
+                                
+                                checkpoint_info = {
+                                    'processed': processed_count,
+                                    'total': total_count,
+                                    'last_save': last_save_str if 'last_save_str' in locals() else last_save,
+                                    'progress': processed_count / total_count * 100 if total_count > 0 else 0
+                                }
+                                
+                                st.success(f"📁 **Checkpoint Found!** {processed_count}/{total_count} rows processed ({checkpoint_info['progress']:.1f}%)")
+                                st.caption(f"Last saved: {checkpoint_info['last_save']}")
+                                
+                                # Show resume option
+                                resume_from_checkpoint = st.checkbox(
+                                    "🔄 Resume from checkpoint",
+                                    value=True,
+                                    help=f"Continue processing from row {processed_count + 1}. Uncheck to start fresh."
+                                )
+                                
+                                if not resume_from_checkpoint:
+                                    st.warning("⚠️ Starting fresh will delete the existing checkpoint and reprocess all rows.")
+                            else:
+                                st.info("ℹ️ No valid checkpoint data found")
+                                resume_from_checkpoint = False
+                        except Exception as e:
+                            st.warning(f"⚠️ Could not read checkpoint: {e}")
+                            resume_from_checkpoint = False
+                    else:
+                        st.info("ℹ️ No checkpoint found - will start fresh processing")
+                        resume_from_checkpoint = False
+                
+                # Checkpoint interval setting
+                col1, col2 = st.columns(2)
+                with col1:
+                    checkpoint_interval = st.number_input(
+                        "Checkpoint Interval",
+                        min_value=5,
+                        max_value=100,
+                        value=5,
+                        step=5,
+                        help="Save progress every N rows (recommended: 5-10)"
+                    )
+                
+                with col2:
+                    if checkpoint_info:
+                        st.metric("Current Progress", f"{checkpoint_info['processed']}/{checkpoint_info['total']}", 
+                                 f"{checkpoint_info['progress']:.1f}%")
+
+                # Interrupt handling info
+                st.info("ℹ️ **Interrupt Handling:** Processing can be safely interrupted with Ctrl+C. Progress will be automatically saved and can be resumed later.")
+
+                st.divider()
+
                 # Process button
-                if st.button("Start Summarization", type="primary", use_container_width=True):
+                if st.button("🤖 Start Summarization", type="primary", use_container_width=True):
+                    # Capture checkpoint settings before the button click
+                    should_resume = 'resume_from_checkpoint' in locals() and resume_from_checkpoint
+                    saved_checkpoint_interval = checkpoint_interval if 'checkpoint_interval' in locals() else 5
+                    
+                    # Handle checkpoint deletion if not resuming
+                    if not should_resume and 'checkpoint_info' in locals() and checkpoint_info:
+                        checkpoint_file = Path("summarised_content") / f"{selected_csv_path.stem}_checkpoint.json"
+                        if checkpoint_file.exists():
+                            checkpoint_file.unlink()
+                            st.info("🗑️ Existing checkpoint deleted - starting fresh")
+                    
                     # Use the selected CSV file path directly (no need for temp file)
                     try:
                         # Set processing flag
@@ -2182,12 +2273,14 @@ elif page == "Summarization":
                             if content_col is None:
                                 raise ValueError("No content column selected")
                             
-                            # Use the detected content column
+                            # Use the detected content column with checkpoint settings
                             df_result, duration, metadata = await summarize_csv_file(
                                 selected_csv_path, 
                                 content_col,
                                 progress_callback=update_progress,
-                                custom_model=selected_model
+                                custom_model=selected_model,
+                                use_checkpoint=True,
+                                checkpoint_interval=saved_checkpoint_interval
                             )
                             return df_result, duration, metadata
 
@@ -3476,12 +3569,12 @@ elif page == "Chatbot":
             
             # Parse S3 filenames to extract source name and create mapping
             for s3_file in s3_files:
-                # Extract index name from path: "rag_embeddings/Techcrunch_20251128_embeddings.pkl"
+                # Extract index name from path: "rag_embeddings/techcrunch_embeddings_20251204.pkl"
                 index_name = s3_file.replace("rag_embeddings/", "").replace(".pkl", "")
                 
-                # Extract source name (first part before date)
+                # Extract source name from index_name format: "source_embeddings_YYYYMMDD"
                 import re
-                match = re.match(r'^([A-Za-z\-]+)', index_name)
+                match = re.match(r'^([a-z\-]+)_embeddings', index_name)
                 if match:
                     source_name = match.group(1)
                     s3_available_indexes.append(source_name)

@@ -345,9 +345,9 @@ Content: {indicator}"""
         source_name = self.extract_source_name(json_path_obj.name)
         date_str = self.extract_date_from_filename(json_path_obj.name)
         
-        # Include date in index name if available
+        # Format: <source>_embeddings_<processed_date>
         if date_str:
-            index_name = f"{source_name}_{date_str}_embeddings"
+            index_name = f"{source_name}_embeddings_{date_str}"
         else:
             index_name = f"{source_name}_embeddings"
         
@@ -644,44 +644,56 @@ Content: {indicator}"""
     def extract_source_name(self, filename: str) -> str:
         """
         Extract and format source name from filename.
+        Handles patterns like:
+        - "techcrunch_com_20251127.json" -> "techcrunch"
+        - "pv-magazine_com_20251204.json" -> "pv-magazine"
+        - "hydrogen-central_com_20251204_filtered_20251204.json" -> "hydrogen-central"
         
         Args:
-            filename: Filename like "techcrunch_com_20251127.json"
+            filename: Filename with source name
             
         Returns:
-            Formatted source name like "TechCrunch"
+            Source name (lowercase with hyphens preserved)
         """
-        # Remove .json extension and split by underscores
+        import re
+        
+        # Remove extension
         stem = Path(filename).stem
-        parts = stem.split('_')
         
-        # Take first part and capitalize it
-        if parts:
-            source = parts[0].replace('com', '').replace('org', '').replace('net', '')
-            # Capitalize first letter
-            return source.capitalize()
+        # Remove all date patterns (YYYYMMDD)
+        stem_no_dates = re.sub(r'_?\d{8}', '', stem)
         
-        return stem
+        # Remove common suffixes
+        stem_no_dates = re.sub(r'_(com|org|net|filtered|crawl|processed).*$', '', stem_no_dates)
+        
+        # Clean up multiple underscores
+        stem_no_dates = re.sub(r'_+', '_', stem_no_dates).strip('_')
+        
+        return stem_no_dates.lower() if stem_no_dates else stem
     
     def extract_date_from_filename(self, filename: str) -> str:
         """
-        Extract date from filename.
+        Extract date from filename. Handles multiple date formats:
+        - "techcrunch_com_20251127.json" -> "20251127"
+        - "techcrunch_com_20251204_filtered_20251204.json" -> "20251204" (last date)
         
         Args:
-            filename: Filename like "techcrunch_com_20251127.json"
+            filename: Filename with date pattern
             
         Returns:
             Date string in YYYYMMDD format or empty string if not found
         """
         import re
         
-        # Remove .json extension
+        # Remove .json/.csv extension
         stem = Path(filename).stem
         
-        # Look for date pattern YYYYMMDD at the end
-        date_match = re.search(r'_(\d{8})$', stem)
-        if date_match:
-            return date_match.group(1)
+        # Find ALL date patterns (YYYYMMDD) in the filename
+        date_matches = re.findall(r'\d{8}', stem)
+        
+        if date_matches:
+            # Return the LAST date found (which is typically the processed date)
+            return date_matches[-1]
         
         return ""
     
